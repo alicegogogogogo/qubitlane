@@ -3,16 +3,22 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Callable
 
+from .density import (
+    MAX_NOISE_QUBITS,
+    assert_trace,
+    density_probabilities,
+    simulate_density,
+)
 from .errors import ConflictError, NotFoundError, ValidationError
-from .model import CircuitRequest, SimulationRequest
+from .model import CircuitRequest, Noise, SimulationRequest
 from .qasm import Circuit, identifier, parse_circuit
 from .simulator import (
     Sampler,
     assert_normalized,
-    distribution,
     nonzero_amplitudes,
     probabilities,
     simulate,
+    weight_distribution,
 )
 from .store import Store
 
@@ -74,9 +80,13 @@ class QubitLane:
         _require_key(key)
         identifier(circuit_id, "circuit id")
         request = SimulationRequest.parse(raw)
-        self.get_circuit(circuit_id)
+        document = self.get_circuit(circuit_id)
+        if request.noise is not None and document["qubits"] > MAX_NOISE_QUBITS:
+            raise ValidationError(
+                f"noise is supported for circuits of at most {MAX_NOISE_QUBITS} qubits"
+            )
 
-        job_id = self._job_id(circuit_id, request.shots, request.seed)
+        job_id = self._job_id(circuit_id, request.shots, request.seed, request.noise)
 
         def run() -> dict[str, Any]:
             existing = self.store.connection.execute(
@@ -119,14 +129,19 @@ class QubitLane:
 
     def _execute(self, circuit_id: str, job_id: str, request: SimulationRequest) -> dict[str, Any]:
         circuit = self._load(circuit_id)
-        state = simulate(circuit)
-        defect = assert_normalized(state)
-        weights = probabilities(state)
+        if request.noise is None:
+            state = simulate(circuit)
+            defect = assert_normalized(state)
+            weights = probabilities(state)
+        else:
+            density = simulate_density(circuit, request.noise.probability)
+            defect = assert_trace(density, 1 << circuit.qubits)
+            weights = density_probabilities(density, 1 << circuit.qubits)
         sampler = Sampler(request.seed)
         raw_counts = sampler.sample(weights, request.shots, circuit.qubits)
         counts = {self._measured_key(circuit, label): value for label, value in raw_counts.items()}
         ordered = {key: counts[key] for key in sorted(counts)}
-        return {
+        job = {
             "id": job_id,
             "circuit_id": circuit.id,
             "state": "completed",
@@ -135,11 +150,14 @@ class QubitLane:
             "qubits": circuit.qubits,
             "bit_order": "little_endian",
             "normalization_error": defect,
-            "probabilities": distribution(circuit, state),
+            "probabilities": weight_distribution(circuit, weights),
             "counts": ordered,
             "measured_bits": self._measured_bit_count(circuit),
             "created_at": self.store.now(),
         }
+        if request.noise is not None:
+            job["noise"] = request.noise.as_dict()
+        return job
 
     @staticmethod
     def _measured_bit_count(circuit: Circuit) -> int:
@@ -148,9 +166,11 @@ class QubitLane:
         return max(clbit for _, clbit in circuit.measurements) + 1
 
     @staticmethod
-    def _job_id(circuit_id: str, shots: int, seed: int) -> str:
-        raw = f"{circuit_id}|{shots}|{seed}".encode("utf-8")
-        return f"j-{hashlib.sha256(raw).hexdigest()[:16]}"
+    def _job_id(circuit_id: str, shots: int, seed: int, noise: Noise | None = None) -> str:
+        raw = f"{circuit_id}|{shots}|{seed}"
+        if noise is not None:
+            raw += f"|{noise.type}|{noise.probability!r}"
+        return f"j-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
     @staticmethod
     def _measured_key(circuit: Circuit, label: str) -> str:

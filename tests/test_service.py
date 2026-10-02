@@ -268,5 +268,178 @@ class ServiceTests(unittest.TestCase):
             self.service.create_circuit(circuit_document(qasm, "bad"), self.key())
 
 
+class NoiseTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = QubitLane(str(Path(self.directory.name) / "qubitlane.db"))
+        self.counter = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def key(self, prefix: str = "k") -> str:
+        self.counter += 1
+        return f"{prefix}-{self.counter}"
+
+    def create(self, qasm: str, circuit_id: str) -> None:
+        self.service.create_circuit(circuit_document(qasm, circuit_id), self.key())
+
+    def test_noisy_job_reports_noise_and_stays_normalised(self):
+        self.create(BELL, "bell")
+        job = self.service.simulate(
+            "bell",
+            {"shots": 200, "seed": 4, "noise": {"type": "depolarizing", "probability": 0.1}},
+            self.key(),
+        )
+        self.assertEqual({"type": "depolarizing", "probability": 0.1}, job["noise"])
+        self.assertEqual({"00", "01", "10", "11"}, set(job["probabilities"]))
+        self.assertAlmostEqual(1.0, sum(job["probabilities"].values()), places=9)
+        self.assertLess(job["normalization_error"], TOLERANCE)
+        self.assertEqual(200, sum(job["counts"].values()))
+        repeat = self.service.simulate(
+            "bell",
+            {"shots": 200, "seed": 4, "noise": {"type": "depolarizing", "probability": 0.1}},
+            self.key(),
+        )
+        self.assertEqual(job, repeat)
+
+    def test_zero_probability_matches_the_noiseless_result(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[2];\n"
+            "h q[0];\nt q[1];\nrx(0.7) q[0];\nry(1.1) q[1];\nrz(-0.3) q[0];\n"
+            "cx q[0], q[1];\ncz q[1], q[0];\n"
+        )
+        self.create(qasm, "gates")
+        plain = self.service.simulate("gates", {"shots": 10, "seed": 1}, self.key())
+        noisy = self.service.simulate(
+            "gates",
+            {"shots": 10, "seed": 1, "noise": {"type": "depolarizing", "probability": 0}},
+            self.key(),
+        )
+        self.assertEqual(plain["probabilities"], noisy["probabilities"])
+        self.assertNotEqual(plain["id"], noisy["id"])
+
+    def test_measure_does_not_trigger_the_channel(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\ncreg c[1];\nx q[0];\nmeasure q[0] -> c[0];\n"
+        self.create(qasm, "one")
+        job = self.service.simulate(
+            "one",
+            {"shots": 30, "seed": 2, "noise": {"type": "depolarizing", "probability": 1}},
+            self.key(),
+        )
+        self.assertAlmostEqual(2 / 3, job["probabilities"]["0"], places=12)
+        self.assertAlmostEqual(1 / 3, job["probabilities"]["1"], places=12)
+
+    def test_two_qubit_gate_applies_the_channel_to_each_target_once(self):
+        qasm = "OPENQASM 2.0;\nqreg q[2];\nx q[0];\ncx q[0], q[1];\n"
+        self.create(qasm, "pair")
+        job = self.service.simulate(
+            "pair",
+            {"shots": 30, "seed": 2, "noise": {"type": "depolarizing", "probability": 1}},
+            self.key(),
+        )
+        expected = {"00": 2 / 9, "01": 2 / 9, "10": 2 / 9, "11": 1 / 3}
+        for label, probability in expected.items():
+            self.assertAlmostEqual(probability, job["probabilities"][label], places=12)
+
+    def test_noise_is_part_of_the_job_id(self):
+        self.create(BELL, "bell")
+        plain = self.service.simulate("bell", {"shots": 10, "seed": 1}, self.key())
+        quiet = self.service.simulate(
+            "bell",
+            {"shots": 10, "seed": 1, "noise": {"type": "depolarizing", "probability": 0.01}},
+            self.key(),
+        )
+        same = self.service.simulate(
+            "bell",
+            {"shots": 10, "seed": 1, "noise": {"type": "depolarizing", "probability": 0.010}},
+            self.key(),
+        )
+        louder = self.service.simulate(
+            "bell",
+            {"shots": 10, "seed": 1, "noise": {"type": "depolarizing", "probability": 0.02}},
+            self.key(),
+        )
+        self.assertNotEqual(plain["id"], quiet["id"])
+        self.assertEqual(quiet["id"], same["id"])
+        self.assertEqual(quiet, same)
+        self.assertNotEqual(quiet["id"], louder["id"])
+        self.assertEqual(quiet, self.service.get_job(quiet["id"]))
+
+    def test_idempotent_replay_returns_the_first_noisy_job(self):
+        self.create(BELL, "bell")
+        body = {"shots": 50, "seed": 9, "noise": {"type": "depolarizing", "probability": 0.5}}
+        first = self.service.simulate("bell", body, "noisy-key")
+        second = self.service.simulate("bell", body, "noisy-key")
+        self.assertEqual(first, second)
+
+    def test_measured_bits_projection_still_applies_with_noise(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[2];\ncreg c[2];\n"
+            "x q[1];\nmeasure q[1] -> c[0];\n"
+        )
+        self.create(qasm, "proj")
+        job = self.service.simulate(
+            "proj",
+            {"shots": 16, "seed": 3, "noise": {"type": "depolarizing", "probability": 0}},
+            self.key(),
+        )
+        self.assertEqual(1, job["measured_bits"])
+        self.assertEqual({"1": 16}, job["counts"])
+
+    def test_noise_validation_errors_create_no_job(self):
+        self.create(BELL, "bell")
+        bad_bodies = [
+            ({"noise": "depolarizing"}, "JSON object"),
+            ({"noise": None}, "JSON object"),
+            ({"noise": {"type": "depolarizing", "probability": 0.1, "p": 1}}, "unknown fields"),
+            ({"noise": {"probability": 0.1}}, "must contain a type"),
+            ({"noise": {"type": "amplitude", "probability": 0.1}}, "type must be"),
+            ({"noise": {"type": "depolarizing"}}, "must contain a probability"),
+            ({"noise": {"type": "depolarizing", "probability": True}}, "probability must be a number"),
+            ({"noise": {"type": "depolarizing", "probability": "0.1"}}, "probability must be a number"),
+            ({"noise": {"type": "depolarizing", "probability": -0.1}}, "between 0 and 1"),
+            ({"noise": {"type": "depolarizing", "probability": 1.1}}, "between 0 and 1"),
+            ({"noise": {"type": "depolarizing", "probability": float("nan")}}, "between 0 and 1"),
+        ]
+        for body, message in bad_bodies:
+            with self.subTest(body=body):
+                with self.assertRaisesRegex(ValidationError, message):
+                    self.service.simulate("bell", body, self.key())
+        jobs = self.service.store.connection.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()
+        self.assertEqual(0, jobs["n"])
+
+    def test_probability_accepts_the_closed_interval(self):
+        self.create(BELL, "bell")
+        for probability in (0, 1):
+            job = self.service.simulate(
+                "bell",
+                {"shots": 5, "seed": 1, "noise": {"type": "depolarizing", "probability": probability}},
+                self.key(),
+            )
+            self.assertEqual(float(probability), job["noise"]["probability"])
+
+    def test_noise_is_limited_to_eight_qubits(self):
+        qasm = "OPENQASM 2.0;\nqreg q[9];\nh q[0];\n"
+        self.create(qasm, "wide")
+        with self.assertRaisesRegex(ValidationError, "at most 8 qubits"):
+            self.service.simulate(
+                "wide",
+                {"shots": 1, "noise": {"type": "depolarizing", "probability": 0.1}},
+                self.key(),
+            )
+        plain = self.service.simulate("wide", {"shots": 4, "seed": 1}, self.key())
+        self.assertEqual(9, plain["qubits"])
+        self.assertNotIn("noise", plain)
+
+    def test_noiseless_surface_is_unchanged(self):
+        self.create(BELL, "bell")
+        job = self.service.simulate("bell", {"shots": 32, "seed": 6}, self.key())
+        self.assertNotIn("noise", job)
+        self.assertEqual(job, self.service.get_job(job["id"]))
+        statevector = self.service.get_statevector("bell")
+        self.assertEqual(["00", "11"], [entry["basis"] for entry in statevector["amplitudes"]])
+
+
 if __name__ == "__main__":
     unittest.main()

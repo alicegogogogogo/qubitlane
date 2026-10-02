@@ -16,6 +16,8 @@ The initial release intentionally supports a compact public contract:
   job;
 - sampling uses an explicit `seed`, so the same circuit, `shots`, and `seed`
   always produce byte-identical counts;
+- an optional gate-level depolarizing noise model evolves the exact mixed
+  state (density matrix) instead of a pure statevector;
 - both state-changing POSTs require an `Idempotency-Key` header.
 
 ## Requirements
@@ -137,6 +139,38 @@ The body is optional. `shots` defaults to `1024` and must be an integer between
   `seed` (`j-` plus 16 hex characters), so repeating a request after losing the
   response yields the same job instead of a second sampling run.
 
+### Simulating with noise
+
+The simulate body accepts an optional `noise` object:
+
+```http
+POST /circuits/bell/simulate
+Idempotency-Key: demo-simulate-2
+Content-Type: application/json
+
+{"shots": 512, "seed": 7, "noise": {"type": "depolarizing", "probability": 0.01}}
+```
+
+`noise` may only contain `type` and `probability`; `type` must be
+`"depolarizing"` and `probability` must be a finite JSON number in the closed
+interval `[0, 1]` (a boolean is not a number). Anything else is a
+`validation_error` that names the offending field, and no job is created.
+
+With noise enabled the circuit is evolved as an exact density matrix: after
+every gate, each qubit in that gate's `targets` undergoes the channel
+`rho -> (1 - p) rho + p/3 (X rho X + Y rho Y + Z rho Z)` once, in statement
+order; `measure` statements do not trigger the channel. `probabilities` still
+covers all `2^qubits` big-endian basis states (their sum stays within `1e-9`
+of 1) and `counts` are sampled from those probabilities with the same
+deterministic `shots`/`seed` scheme and classical-bit projection as the
+noiseless path. The response carries an extra `noise` member echoing `type`
+and `probability`, and the noise configuration is part of the job id, so
+numerically identical configurations share an id while noisy and noiseless
+runs of the same circuit never collide. Noise is supported for circuits of at
+most 8 qubits; larger circuits are rejected with a `validation_error` (the
+noiseless limit stays 16 qubits). Omitting `noise` leaves the job id, the
+response shape, and the counts exactly as before.
+
 ### Read the statevector
 
 ```http
@@ -172,16 +206,19 @@ sampling run over a circuit. The stored records are:
   `operations`, `source_lines`, `qasm`;
 - `job`: `id`, `circuit_id`, `state` (always `completed`), `shots`, `seed`,
   `qubits`, `bit_order`, `normalization_error`, `probabilities`, `counts`,
-  `measured_bits`, `created_at`.
+  `measured_bits`, `created_at`, plus `noise` (`type`, `probability`) when the
+  simulation requested the depolarizing channel.
 
 ## Invariants
 
 - The statevector is normalised: `|sum |alpha|^2 - 1| < 1e-9` after every gate.
   `normalization_error` reports the measured defect, which is a small number
-  such as `2.220446049250313e-16` and is always below the tolerance.
+  such as `2.220446049250313e-16` and is always below the tolerance. For noisy
+  jobs the same field reports the density-matrix trace defect
+  `|trace(rho) - 1|`.
 - Gate application preserves the `2^qubits` dimension of the statevector.
 - Identical `(circuit, shots, seed)` always produce identical `counts`, and
-  `|counts| == shots`.
+  `|counts| == shots`; identical `(circuit, shots, seed, noise)` do as well.
 - Out-of-range qubit or classical bit indices, unknown gates, and unknown
   request fields are rejected as `validation_error` rather than ignored.
 

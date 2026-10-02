@@ -171,9 +171,15 @@ def nonzero_amplitudes(circuit: Circuit, state: list[complex]) -> list[dict[str,
 def distribution(circuit: Circuit, state: list[complex]) -> dict[str, float]:
     """Every basis state with its probability, keyed by big-endian label."""
 
+    return weight_distribution(circuit, probabilities(state))
+
+
+def weight_distribution(circuit: Circuit, weights: list[float]) -> dict[str, float]:
+    """Every basis state with its probability, keyed by big-endian label."""
+
     return {
-        basis_label(index, circuit.qubits): clean(probability)
-        for index, probability in enumerate(probabilities(state))
+        basis_label(index, circuit.qubits): clean(weight)
+        for index, weight in enumerate(weights)
     }
 
 

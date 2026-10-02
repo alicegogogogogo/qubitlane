@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,16 +77,47 @@ class CircuitRequest:
 
 
 @dataclass(frozen=True)
+class Noise:
+    """A gate-level depolarizing channel applied after every gate."""
+
+    type: str
+    probability: float
+
+    @classmethod
+    def parse(cls, raw: Any) -> "Noise":
+        body = _require_object(raw, "noise")
+        _reject_unknown(body, {"type", "probability"}, "noise")
+        if "type" not in body:
+            raise ValidationError("noise must contain a type")
+        if body["type"] != "depolarizing":
+            raise ValidationError("noise type must be 'depolarizing'")
+        if "probability" not in body:
+            raise ValidationError("noise must contain a probability")
+        probability = body["probability"]
+        if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+            raise ValidationError("noise probability must be a number")
+        probability = float(probability)
+        if not math.isfinite(probability) or probability < 0.0 or probability > 1.0:
+            raise ValidationError("noise probability must be between 0 and 1")
+        return cls(type="depolarizing", probability=probability)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"type": self.type, "probability": self.probability}
+
+
+@dataclass(frozen=True)
 class SimulationRequest:
     shots: int
     seed: int
+    noise: Noise | None = None
 
     @classmethod
     def parse(cls, raw: Any) -> "SimulationRequest":
         if raw is None:
             return cls(DEFAULT_SHOTS, DEFAULT_SEED)
         body = _require_object(raw, "simulation")
-        _reject_unknown(body, {"shots", "seed"}, "simulation request")
+        _reject_unknown(body, {"shots", "seed", "noise"}, "simulation request")
         shots = _shots(body["shots"]) if "shots" in body else DEFAULT_SHOTS
         seed = _seed(body["seed"]) if "seed" in body else DEFAULT_SEED
-        return cls(shots, seed)
+        noise = Noise.parse(body["noise"]) if "noise" in body else None
+        return cls(shots, seed, noise)
