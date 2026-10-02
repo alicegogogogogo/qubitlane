@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,6 +46,38 @@ def _seed(value: Any) -> int:
     return value
 
 
+@dataclass(frozen=True)
+class NoiseSpec:
+    """A validated `noise` object: depolarizing channel with probability `p`."""
+
+    type: str
+    probability: float
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"type": self.type, "probability": self.probability}
+
+
+def _noise(value: Any) -> NoiseSpec:
+    if not isinstance(value, dict):
+        raise ValidationError("noise must be a JSON object")
+    _reject_unknown(value, {"type", "probability"}, "noise")
+    if "type" not in value:
+        raise ValidationError("noise must contain a type field")
+    if "probability" not in value:
+        raise ValidationError("noise must contain a probability field")
+    if value["type"] != "depolarizing":
+        raise ValidationError('noise type must be "depolarizing"')
+    probability = value["probability"]
+    if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+        raise ValidationError("noise probability must be a number")
+    probability = float(probability)
+    if not math.isfinite(probability):
+        raise ValidationError("noise probability must be a finite number")
+    if probability < 0.0 or probability > 1.0:
+        raise ValidationError("noise probability must be between 0 and 1")
+    return NoiseSpec("depolarizing", probability)
+
+
 def content_id(qasm: str) -> str:
     """Deterministic circuit identifier derived from the source text."""
 
@@ -79,13 +112,15 @@ class CircuitRequest:
 class SimulationRequest:
     shots: int
     seed: int
+    noise: NoiseSpec | None = None
 
     @classmethod
     def parse(cls, raw: Any) -> "SimulationRequest":
         if raw is None:
             return cls(DEFAULT_SHOTS, DEFAULT_SEED)
         body = _require_object(raw, "simulation")
-        _reject_unknown(body, {"shots", "seed"}, "simulation request")
+        _reject_unknown(body, {"shots", "seed", "noise"}, "simulation request")
         shots = _shots(body["shots"]) if "shots" in body else DEFAULT_SHOTS
         seed = _seed(body["seed"]) if "seed" in body else DEFAULT_SEED
-        return cls(shots, seed)
+        noise = _noise(body["noise"]) if "noise" in body else None
+        return cls(shots, seed, noise)

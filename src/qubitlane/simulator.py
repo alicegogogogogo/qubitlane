@@ -19,6 +19,8 @@ from .qasm import Circuit, Operation
 TOLERANCE = 1e-9
 ROUND_DIGITS = 12
 
+MAX_NOISE_QUBITS = 8
+
 _SQRT_HALF = math.sqrt(0.5)
 
 
@@ -111,6 +113,156 @@ def simulate(circuit: Circuit) -> list[complex]:
     return state
 
 
+# -- density-matrix simulation with depolarizing noise ----------------------
+#
+# The density matrix is flattened into a vector of length `4^qubits` with
+# `rho[row * 2^qubits + column]`: the column bits occupy the low half and the
+# row bits the high half, so the vector behaves like a statevector of
+# `2 * qubits` qubits. Conjugating by a gate then means applying `U` to the
+# row (high) qubits and `conj(U)` to the column (low) qubits, because
+# `vec(U rho U-dagger) = (U (x) conj(U)) vec(rho)`.
+
+_PAULIS: tuple[tuple[tuple[complex, ...], ...], ...] = (
+    ((0, 1), (1, 0)),  # X
+    ((0, -1j), (1j, 0)),  # Y
+    ((1, 0), (0, -1)),  # Z
+)
+
+
+def _gate_matrix(operation: Operation) -> tuple[tuple[complex, ...], ...]:
+    """The unitary of one gate, matching `_apply_single_qubit`/`_apply_controlled`."""
+
+    name = operation.name
+    if name == "h":
+        return ((_SQRT_HALF, _SQRT_HALF), (_SQRT_HALF, -_SQRT_HALF))
+    if name == "x":
+        return ((0, 1), (1, 0))
+    if name == "y":
+        return ((0, -1j), (1j, 0))
+    if name == "z":
+        return ((1, 0), (0, -1))
+    if name == "s":
+        return ((1, 0), (0, 1j))
+    if name == "t":
+        return ((1, 0), (0, cmath.exp(1j * math.pi / 4)))
+    if name == "rx":
+        cosine = math.cos(operation.angle / 2)
+        sine = _rotation(True, operation.angle / 2)
+        return ((cosine, sine), (sine, cosine))
+    if name == "ry":
+        cosine = math.cos(operation.angle / 2)
+        sine = _rotation(False, operation.angle / 2)
+        return ((cosine, -sine), (sine, cosine))
+    if name == "rz":
+        return (
+            (cmath.exp(-1j * operation.angle / 2), 0),
+            (0, cmath.exp(1j * operation.angle / 2)),
+        )
+    if name == "cx":
+        return ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 0, 1), (0, 0, 1, 0))
+    if name == "cz":
+        return ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, -1))
+    raise ValidationError(f"unsupported gate {name!r}")  # pragma: no cover
+
+
+def _conjugate(matrix: tuple[tuple[complex, ...], ...]) -> tuple[tuple[complex, ...], ...]:
+    return tuple(tuple(entry.conjugate() for entry in row) for row in matrix)
+
+
+def _apply_matrix(
+    state: list[complex], targets: tuple[int, ...], matrix: tuple[tuple[complex, ...], ...]
+) -> None:
+    """Apply `matrix` to `targets` of a statevector, in place.
+
+    Bit `len(targets) - 1 - j` of a matrix row/column index corresponds to
+    `targets[j]`, so a two-qubit matrix is indexed by `(control, target)`.
+    """
+
+    width = len(targets)
+    size = 1 << width
+    offsets: list[int] = []
+    for sub in range(size):
+        offset = 0
+        for position, target in enumerate(targets):
+            if sub & (1 << (width - 1 - position)):
+                offset |= 1 << target
+        offsets.append(offset)
+    covered = 0
+    for target in targets:
+        covered |= 1 << target
+    for index in range(len(state)):
+        if index & covered:
+            continue
+        gathered = [state[index | offset] for offset in offsets]
+        for row in range(size):
+            entries = matrix[row]
+            total = 0j
+            for column in range(size):
+                coefficient = entries[column]
+                if coefficient:
+                    total += coefficient * gathered[column]
+            state[index | offsets[row]] = total
+
+
+def _depolarize(rho: list[complex], qubits: int, target: int, probability: float) -> None:
+    """Mix `rho` as `(1 - p) rho + p/3 (X rho X + Y rho Y + Z rho Z)` on `target`."""
+
+    original = list(rho)
+    keep = 1.0 - probability
+    for index in range(len(rho)):
+        rho[index] *= keep
+    share = probability / 3.0
+    row_target = (qubits + target,)
+    column_target = (target,)
+    for pauli in _PAULIS:
+        transformed = list(original)
+        _apply_matrix(transformed, row_target, pauli)
+        _apply_matrix(transformed, column_target, _conjugate(pauli))
+        for index in range(len(rho)):
+            rho[index] += share * transformed[index]
+
+
+def simulate_density(circuit: Circuit, probability: float) -> list[complex]:
+    """Exact mixed-state evolution under gate-by-gate depolarizing noise.
+
+    Every gate is conjugated onto the density matrix in statement order, and
+    each of the gate's target qubits then passes through the depolarizing
+    channel once. `measure` statements are skipped and never trigger noise.
+    """
+
+    qubits = circuit.qubits
+    rho = [0j] * (1 << (2 * qubits))
+    rho[0] = 1 + 0j
+    for operation in circuit.operations:
+        if operation.name == "measure":
+            continue
+        matrix = _gate_matrix(operation)
+        row_targets = tuple(qubits + target for target in operation.targets)
+        _apply_matrix(rho, row_targets, matrix)
+        _apply_matrix(rho, operation.targets, _conjugate(matrix))
+        for target in operation.targets:
+            _depolarize(rho, qubits, target, probability)
+    return rho
+
+
+def density_probabilities(rho: list[complex], qubits: int) -> list[float]:
+    """The diagonal of a flattened density matrix: one probability per basis state."""
+
+    width = 1 << qubits
+    return [rho[index * width + index].real for index in range(width)]
+
+
+def assert_normalized_weights(weights: list[float]) -> float:
+    """Return the probability-sum defect, raising when it exceeds the tolerance."""
+
+    defect = abs(sum(weights) - 1.0)
+    if defect >= TOLERANCE:
+        raise ValidationError(
+            f"probabilities are not normalised: |sum minus 1| = {defect:.3e}"
+        )
+    return defect
+
+
 def norm_squared(state: list[complex]) -> float:
     return sum(abs(amplitude) ** 2 for amplitude in state)
 
@@ -171,9 +323,15 @@ def nonzero_amplitudes(circuit: Circuit, state: list[complex]) -> list[dict[str,
 def distribution(circuit: Circuit, state: list[complex]) -> dict[str, float]:
     """Every basis state with its probability, keyed by big-endian label."""
 
+    return weight_distribution(circuit, probabilities(state))
+
+
+def weight_distribution(circuit: Circuit, weights: list[float]) -> dict[str, float]:
+    """Every basis state with its probability, keyed by big-endian label."""
+
     return {
-        basis_label(index, circuit.qubits): clean(probability)
-        for index, probability in enumerate(probabilities(state))
+        basis_label(index, circuit.qubits): clean(weight)
+        for index, weight in enumerate(weights)
     }
 
 

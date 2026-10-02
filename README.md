@@ -137,6 +137,34 @@ The body is optional. `shots` defaults to `1024` and must be an integer between
   `seed` (`j-` plus 16 hex characters), so repeating a request after losing the
   response yields the same job instead of a second sampling run.
 
+#### Optional depolarizing noise
+
+```http
+POST /circuits/bell/simulate
+Idempotency-Key: demo-simulate-2
+Content-Type: application/json
+
+{"shots": 512, "seed": 7, "noise": {"type": "depolarizing", "probability": 0.01}}
+```
+
+An optional `noise` object switches the simulation from a pure statevector to
+an exact mixed-state (density matrix) evolution. `noise` accepts exactly two
+fields: `type`, which must be `"depolarizing"`, and `probability`, a finite
+JSON number in the closed interval `[0, 1]` (a boolean is not a number). After
+every gate, each of the gate's target qubits passes through the channel
+`(1 - p) rho + p/3 (X rho X + Y rho Y + Z rho Z)` once, in statement order;
+`measure` statements never trigger the channel. Noisy simulation supports at
+most 8 qubits (the quiet limit stays 16).
+
+A noisy job echoes the noise back as `"noise":{"type":"depolarizing",
+"probability":...}` and is otherwise identical in shape: `probabilities` still
+covers all `2^qubits` big-endian basis states with a sum within `1e-9` of 1,
+and `counts` are sampled deterministically from the final probabilities with
+the same classical-bit projection. The noise configuration is part of the job
+id, so numerically equal configurations share one id while any change in
+`probability` yields a different job. Omitting `noise` leaves the job id, the
+response, and the counts exactly as before.
+
 ### Read the statevector
 
 ```http
@@ -172,7 +200,8 @@ sampling run over a circuit. The stored records are:
   `operations`, `source_lines`, `qasm`;
 - `job`: `id`, `circuit_id`, `state` (always `completed`), `shots`, `seed`,
   `qubits`, `bit_order`, `normalization_error`, `probabilities`, `counts`,
-  `measured_bits`, `created_at`.
+  `measured_bits`, `created_at`, plus `noise` when the simulation requested
+  depolarizing noise.
 
 ## Invariants
 

@@ -268,5 +268,166 @@ class ServiceTests(unittest.TestCase):
             self.service.create_circuit(circuit_document(qasm, "bad"), self.key())
 
 
+class NoiseTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = QubitLane(str(Path(self.directory.name) / "qubitlane.db"))
+        self.counter = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def key(self, prefix: str = "k") -> str:
+        self.counter += 1
+        return f"{prefix}-{self.counter}"
+
+    def noise(self, probability: float = 0.01) -> dict:
+        return {"type": "depolarizing", "probability": probability}
+
+    def test_noisy_job_reports_noise_and_is_deterministic(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        body = {"shots": 200, "seed": 9, "noise": self.noise(0.05)}
+        first = self.service.simulate("bell", body, self.key())
+        self.assertEqual(self.noise(0.05), first["noise"])
+        self.assertEqual(200, sum(first["counts"].values()))
+        self.assertEqual({"00", "01", "10", "11"}, set(first["probabilities"]))
+        self.assertAlmostEqual(1.0, sum(first["probabilities"].values()), places=9)
+        self.assertLess(first["normalization_error"], TOLERANCE)
+        repeated = self.service.simulate("bell", body, self.key())
+        self.assertEqual(first, repeated)
+        self.assertEqual(first, self.service.get_job(first["id"]))
+
+    def test_noise_changes_the_job_id_and_counts(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        quiet = self.service.simulate("bell", {"shots": 200, "seed": 9}, self.key())
+        noisy = self.service.simulate(
+            "bell", {"shots": 200, "seed": 9, "noise": self.noise(0.4)}, self.key()
+        )
+        self.assertNotEqual(quiet["id"], noisy["id"])
+        self.assertNotIn("noise", quiet)
+        self.assertNotEqual(quiet["probabilities"], noisy["probabilities"])
+
+    def test_numerically_equal_noise_shares_the_job_id(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        first = self.service.simulate(
+            "bell", {"shots": 10, "seed": 1, "noise": self.noise(0.5)}, self.key()
+        )
+        second = self.service.simulate(
+            "bell", {"shots": 10, "seed": 1, "noise": self.noise(0.50)}, self.key()
+        )
+        self.assertEqual(first["id"], second["id"])
+        third = self.service.simulate(
+            "bell", {"shots": 10, "seed": 1, "noise": self.noise(0.25)}, self.key()
+        )
+        self.assertNotEqual(first["id"], third["id"])
+
+    def test_zero_probability_noise_matches_the_quiet_distribution(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        quiet = self.service.simulate("bell", {"shots": 50, "seed": 4}, self.key())
+        noisy = self.service.simulate(
+            "bell", {"shots": 50, "seed": 4, "noise": self.noise(0.0)}, self.key()
+        )
+        self.assertEqual(quiet["probabilities"], noisy["probabilities"])
+        self.assertEqual(quiet["counts"], noisy["counts"])
+
+    def test_depolarizing_channel_mixes_towards_uniform(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nx q[0];\n"
+        self.service.create_circuit(circuit_document(qasm, "one"), self.key())
+        job = self.service.simulate(
+            "one", {"shots": 10, "seed": 1, "noise": self.noise(0.3)}, self.key()
+        )
+        # (1 - p) rho + p/3 (X rho X + Y rho Y + Z rho Z) leaves P(1) = 1 - 2p/3
+        self.assertAlmostEqual(0.8, job["probabilities"]["1"], places=12)
+        self.assertAlmostEqual(0.2, job["probabilities"]["0"], places=12)
+
+    def test_two_qubit_gate_applies_the_channel_to_each_target(self):
+        qasm = "OPENQASM 2.0;\nqreg q[2];\nh q[0];\ncx q[0], q[1];\n"
+        self.service.create_circuit(circuit_document(qasm, "bell2"), self.key())
+        job = self.service.simulate(
+            "bell2", {"shots": 10, "seed": 1, "noise": self.noise(0.25)}, self.key()
+        )
+        expected = {"00": 13 / 36, "01": 5 / 36, "10": 5 / 36, "11": 13 / 36}
+        for label, probability in expected.items():
+            self.assertAlmostEqual(probability, job["probabilities"][label], places=12)
+
+    def test_measure_does_not_trigger_the_channel(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[1];\ncreg c[1];\n"
+            "x q[0];\nmeasure q[0] -> c[0];\n"
+        )
+        self.service.create_circuit(circuit_document(qasm, "m"), self.key())
+        job = self.service.simulate(
+            "m", {"shots": 10, "seed": 1, "noise": self.noise(1.0)}, self.key()
+        )
+        # p = 1 after the x gate leaves P(1) = 1/3; the measure adds no noise
+        self.assertAlmostEqual(1 / 3, job["probabilities"]["1"], places=12)
+        self.assertEqual(1, job["measured_bits"])
+
+    def test_noise_validation_errors(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        with self.assertRaisesRegex(ValidationError, "noise must be a JSON object"):
+            self.service.simulate("bell", {"noise": "depolarizing"}, self.key())
+        with self.assertRaisesRegex(ValidationError, "noise must be a JSON object"):
+            self.service.simulate("bell", {"noise": None}, self.key())
+        with self.assertRaisesRegex(ValidationError, "unknown fields"):
+            self.service.simulate(
+                "bell", {"noise": {**self.noise(), "extra": 1}}, self.key()
+            )
+        with self.assertRaisesRegex(ValidationError, "must contain a type"):
+            self.service.simulate("bell", {"noise": {"probability": 0.1}}, self.key())
+        with self.assertRaisesRegex(ValidationError, "must contain a probability"):
+            self.service.simulate("bell", {"noise": {"type": "depolarizing"}}, self.key())
+        with self.assertRaisesRegex(ValidationError, 'type must be "depolarizing"'):
+            self.service.simulate(
+                "bell", {"noise": {"type": "bitflip", "probability": 0.1}}, self.key()
+            )
+        with self.assertRaisesRegex(ValidationError, "probability must be a number"):
+            self.service.simulate(
+                "bell", {"noise": {"type": "depolarizing", "probability": True}}, self.key()
+            )
+        with self.assertRaisesRegex(ValidationError, "probability must be a number"):
+            self.service.simulate(
+                "bell", {"noise": {"type": "depolarizing", "probability": "0.1"}}, self.key()
+            )
+        with self.assertRaisesRegex(ValidationError, "probability must be a finite number"):
+            self.service.simulate(
+                "bell",
+                {"noise": {"type": "depolarizing", "probability": float("nan")}},
+                self.key(),
+            )
+        with self.assertRaisesRegex(ValidationError, "probability must be between 0 and 1"):
+            self.service.simulate(
+                "bell", {"noise": {"type": "depolarizing", "probability": 1.5}}, self.key()
+            )
+        with self.assertRaisesRegex(ValidationError, "probability must be between 0 and 1"):
+            self.service.simulate(
+                "bell", {"noise": {"type": "depolarizing", "probability": -0.1}}, self.key()
+            )
+
+    def test_boundary_probabilities_are_accepted(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        for probability in (0, 1):
+            job = self.service.simulate(
+                "bell",
+                {"shots": 5, "seed": 1, "noise": self.noise(probability)},
+                self.key(),
+            )
+            self.assertEqual(float(probability), job["noise"]["probability"])
+
+    def test_noise_is_limited_to_eight_qubits(self):
+        qasm = "OPENQASM 2.0;\nqreg q[9];\nh q[0];\n"
+        self.service.create_circuit(circuit_document(qasm, "wide"), self.key())
+        with self.assertRaisesRegex(ValidationError, "at most 8 qubits"):
+            self.service.simulate("wide", {"noise": self.noise()}, self.key())
+        # the failed request created no job, and the quiet 16-qubit bound is intact
+        quiet = self.service.simulate("wide", {"shots": 1}, self.key())
+        self.assertNotIn("noise", quiet)
+        self.assertEqual(9, quiet["qubits"])
+
+    def test_noisy_simulation_of_unknown_circuit_is_not_found(self):
+        with self.assertRaises(NotFoundError):
+            self.service.simulate("missing", {"noise": self.noise()}, self.key())
+
+
 if __name__ == "__main__":
     unittest.main()
