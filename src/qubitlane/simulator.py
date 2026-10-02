@@ -45,7 +45,37 @@ def apply_operation(state: list[complex], qubits: int, operation: Operation) -> 
     if operation.name in ("cx", "cz"):
         _apply_controlled(state, operation.targets[0], operation.targets[1], operation.name)
         return
+    if operation.name == "cu3":
+        _apply_cu3(state, operation.targets[0], operation.targets[1], operation.angles)
+        return
     _apply_single_qubit(state, operation, qubits)
+
+
+def _require_angles(name: str, angles: tuple[float, ...] | None) -> tuple[float, ...]:
+    if angles is None:
+        raise ValidationError(
+            f"gate {name} has an unbound parameter; "
+            "simulate the circuit with parameter bindings"
+        )
+    return angles
+
+
+def _u3_entries(angles: tuple[float, ...]) -> tuple[complex, complex, complex, complex]:
+    """The four entries `(a, b, c, d)` of the OpenQASM U(theta, phi, lambda).
+
+        U = | a  b | = |  cos(t/2)           -e^{i lambda} sin(t/2) |
+            | c  d |   |  e^{i phi} sin(t/2)   e^{i(phi+lambda)} cos(t/2) |
+    """
+
+    theta, phi, lam = angles
+    half = theta / 2
+    cosine = math.cos(half)
+    sine = math.sin(half)
+    a = complex(cosine, 0.0)
+    b = -cmath.exp(1j * lam) * sine
+    c = cmath.exp(1j * phi) * sine
+    d = cmath.exp(1j * (phi + lam)) * cosine
+    return a, b, c, d
 
 
 def _apply_single_qubit(state: list[complex], operation: Operation, qubits: int) -> None:
@@ -60,6 +90,10 @@ def _apply_single_qubit(state: list[complex], operation: Operation, qubits: int)
             f"gate {name} has an unbound parameter; "
             "simulate the circuit with parameter bindings"
         )
+    if name == "u3":
+        u3 = _u3_entries(_require_angles("u3", operation.angles))
+    else:
+        u3 = None
     for index in range(len(state)):
         if index & mask:
             continue
@@ -92,8 +126,32 @@ def _apply_single_qubit(state: list[complex], operation: Operation, qubits: int)
         elif name == "rz":
             state[index] = cmath.exp(-1j * angle / 2) * low
             state[index | mask] = cmath.exp(1j * angle / 2) * high
+        elif name == "u3":
+            a, b, c, d = u3
+            state[index] = a * low + b * high
+            state[index | mask] = c * low + d * high
         else:  # pragma: no cover - the parser rejects unknown gates first
             raise ValidationError(f"unsupported gate {name!r}")
+
+
+def _apply_cu3(
+    state: list[complex],
+    control: int,
+    target: int,
+    angles: tuple[float, ...] | None,
+) -> None:
+    """Apply U(theta, phi, lambda) to `target` where `control` is 1."""
+
+    a, b, c, d = _u3_entries(_require_angles("cu3", angles))
+    control_mask = 1 << control
+    target_mask = 1 << target
+    for index in range(len(state)):
+        if not index & control_mask or index & target_mask:
+            continue
+        low = state[index]
+        high = state[index | target_mask]
+        state[index] = a * low + b * high
+        state[index | target_mask] = c * low + d * high
 
 
 def _apply_controlled(state: list[complex], control: int, target: int, name: str) -> None:
@@ -143,6 +201,11 @@ def _gate_matrix(operation: Operation) -> tuple[tuple[complex, ...], ...]:
             f"gate {name} has an unbound parameter; "
             "simulate the circuit with parameter bindings"
         )
+    if name in ("u3", "cu3") and operation.angles is None:
+        raise ValidationError(
+            f"gate {name} has an unbound parameter; "
+            "simulate the circuit with parameter bindings"
+        )
     if name == "h":
         return ((_SQRT_HALF, _SQRT_HALF), (_SQRT_HALF, -_SQRT_HALF))
     if name == "x":
@@ -168,10 +231,21 @@ def _gate_matrix(operation: Operation) -> tuple[tuple[complex, ...], ...]:
             (cmath.exp(-1j * operation.angle / 2), 0),
             (0, cmath.exp(1j * operation.angle / 2)),
         )
+    if name == "u3":
+        a, b, c, d = _u3_entries(operation.angles)
+        return ((a, b), (c, d))
     if name == "cx":
         return ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 0, 1), (0, 0, 1, 0))
     if name == "cz":
         return ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, -1))
+    if name == "cu3":
+        a, b, c, d = _u3_entries(operation.angles)
+        return (
+            (1, 0, 0, 0),
+            (0, 1, 0, 0),
+            (0, 0, a, b),
+            (0, 0, c, d),
+        )
     raise ValidationError(f"unsupported gate {name!r}")  # pragma: no cover
 
 

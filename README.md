@@ -7,7 +7,7 @@ number of `shots` under a deterministic seed.
 The initial release intentionally supports a compact public contract:
 
 - only a documented OpenQASM 2.0 subset is parsed (`qreg`, `creg`, `h`, `x`,
-  `y`, `z`, `s`, `t`, `rx`, `ry`, `rz`, `cx`, `cz`, `measure`);
+  `y`, `z`, `s`, `t`, `rx`, `ry`, `rz`, `u3`, `cx`, `cz`, `cu3`, `measure`);
 - the statevector index is **little-endian**: `q[0]` is the least significant
   bit, while every probability key and count key printed by the API is
   **big-endian** (most significant qubit first, which is the usual OpenQASM
@@ -89,10 +89,32 @@ any gate. Sizes are limited to 16 qubits and 64 classical bits.
 | --- | --- |
 | `h q[i]`, `x q[i]`, `y q[i]`, `z q[i]`, `s q[i]`, `t q[i]` | one qubit |
 | `rx(angle) q[i]`, `ry(angle) q[i]`, `rz(angle) q[i]` | one qubit |
+| `u3(theta, phi, lambda) q[i]` | one qubit, three angles |
 | `cx q[control], q[target]`, `cz q[control], q[target]` | two distinct qubits |
+| `cu3(theta, phi, lambda) q[control], q[target]` | two distinct qubits, three angles |
 | `measure q[i] -> c[j]` | requires `creg` |
 
 `angle` accepts a plain number, `pi`, `-pi/2`, `2*pi`, and `pi/4` forms.
+Each `u3`/`cu3` angle accepts the same number, `pi`, parameter name, and flat
+`+ - * /` expression rules. `u3` implements the OpenQASM
+`U(theta, phi, lambda)` unitary (up to a global phase):
+
+```
+U = |  cos(theta/2)               -e^{i lambda} sin(theta/2)       |
+    |  e^{i phi} sin(theta/2)     e^{i(phi+lambda)} cos(theta/2)   |
+```
+
+`cu3` leaves `target` unchanged when `control` is `0` and applies that same
+`U` when `control` is `1`; the control and target must name different qubits.
+`u3(pi,0,pi)` is `X`, `u3(pi/2,0,pi)` is `H`, `u3(theta,0,0)` is `ry`, and
+`u3(theta,-pi/2,pi/2)` is `rx`.
+
+In the stored circuit, a `u3`/`cu3` operation carries `angles`: three numbers
+in declaration order when every angle is constant, or three expression texts
+when at least one angle names a parameter (a constant angle inside such a list
+is still emitted as a number). The circuit's `parameters` lists every named
+parameter in first-appearance order.
+
 Statements are separated by `;` and may span lines; `//` starts a comment.
 Anything else — `swap`, `ccx`, barriers, custom `gate` declarations, unknown
 registers, or an index outside its register — is a `validation_error` whose

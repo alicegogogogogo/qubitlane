@@ -696,5 +696,147 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(job, second.get_job(job["id"]))
 
 
+class U3Tests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = QubitLane(str(Path(self.directory.name) / "qubitlane.db"))
+        self.counter = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def key(self, prefix: str = "k") -> str:
+        self.counter += 1
+        return f"{prefix}-{self.counter}"
+
+    def test_u3_document_constant_and_parameter_angles(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[2];\n"
+            "u3(pi/2, 0.1, -pi) q[0];\n"
+            "cu3(theta, phi, lam) q[0], q[1];\n"
+        )
+        document = self.service.create_circuit({"id": "u", "qasm": qasm}, self.key())
+        u3, cu3 = document["operations"]
+        self.assertEqual("u3", u3["name"])
+        self.assertEqual([0], u3["targets"])
+        self.assertAlmostEqual(math.pi / 2, u3["angles"][0], places=12)
+        self.assertEqual(0.1, u3["angles"][1])
+        self.assertAlmostEqual(-math.pi, u3["angles"][2], places=12)
+        self.assertNotIn("angle", u3)
+        self.assertEqual("cu3", cu3["name"])
+        self.assertEqual([0, 1], cu3["targets"])
+        self.assertEqual(["theta", "phi", "lam"], cu3["angles"])
+        self.assertEqual(["theta", "phi", "lam"], document["parameters"])
+
+    def test_mixed_constant_and_parameter_angles(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nu3(theta, pi, 0.5) q[0];\n"
+        document = self.service.create_circuit({"id": "m", "qasm": qasm}, self.key())
+        self.assertEqual(["theta"], document["parameters"])
+        self.assertEqual(["theta", math.pi, 0.5], document["operations"][0]["angles"])
+        circuit = parse_circuit(qasm, "m")
+        bound = circuit.bind({"theta": 0.7})
+        angles = bound.operations[0].angles
+        self.assertAlmostEqual(0.7, angles[0], places=12)
+        self.assertAlmostEqual(math.pi, angles[1], places=12)
+        self.assertEqual(0.5, angles[2])
+
+    def test_parameters_use_first_appearance_order(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[2];\n"
+            "u3(b, a, pi) q[0];\ncu3(a, c, b) q[0], q[1];\n"
+        )
+        circuit = parse_circuit(qasm, "o")
+        self.assertEqual(("b", "a", "c"), circuit.parameters)
+
+    def test_u3_matches_known_gates_up_to_global_phase(self):
+        cases = (
+            ("u3(pi, 0, pi) q[0]", "x q[0]"),
+            ("u3(pi/2, 0, pi) q[0]", "h q[0]"),
+            ("u3(0.9, 0, 0) q[0]", "ry(0.9) q[0]"),
+            ("u3(0.9, -pi/2, pi/2) q[0]", "rx(0.9) q[0]"),
+        )
+        for u3_statement, other in cases:
+            a = simulate(parse_circuit(f"OPENQASM 2.0;\nqreg q[1];\n{u3_statement};\n", "a"))
+            b = simulate(parse_circuit(f"OPENQASM 2.0;\nqreg q[1];\n{other};\n", "b"))
+            self.assertAlmostEqual(abs(a[0]), abs(b[0]), places=12)
+            self.assertAlmostEqual(abs(a[1]), abs(b[1]), places=12)
+
+    def test_cu3_is_controlled(self):
+        # control 0: target untouched
+        q0 = "OPENQASM 2.0;\nqreg q[2];\ncu3(0.4, 0.5, 0.6) q[1], q[0];\n"
+        state0 = simulate(parse_circuit(q0, "c0"))
+        self.assertAlmostEqual(1.0, abs(state0[0]), places=12)
+
+        # control 1: equals the bare u3 on the target inside the 11 sector
+        q1 = "OPENQASM 2.0;\nqreg q[2];\nx q[1];\ncu3(0.4, 0.5, 0.6) q[1], q[0];\n"
+        state1 = simulate(parse_circuit(q1, "c1"))
+        q2 = "OPENQASM 2.0;\nqreg q[1];\nu3(0.4, 0.5, 0.6) q[0];\n"
+        bare = simulate(parse_circuit(q2, "u"))
+        self.assertAlmostEqual(bare[0], state1[2], places=12)
+        self.assertAlmostEqual(bare[1], state1[3], places=12)
+
+    def test_u3_and_cu3_parse_errors_carry_line_numbers(self):
+        cases = (
+            "OPENQASM 2.0;\nqreg q[2];\nu3(pi, 0) q[0];\n",
+            "OPENQASM 2.0;\nqreg q[2];\nu3(pi, 0, 0, 0) q[0];\n",
+            "OPENQASM 2.0;\nqreg q[2];\nu3(pi, , 0) q[0];\n",
+            "OPENQASM 2.0;\nqreg q[2];\nu3(pi, 0, x?) q[0];\n",
+            "OPENQASM 2.0;\nqreg q[2];\ncu3(pi, 0, pi) q[0], q[0];\n",
+            "OPENQASM 2.0;\nqreg q[2];\nu3(pi, 0, pi) q[5];\n",
+            "OPENQASM 2.0;\nqreg q[2];\ncu3(pi, 0, pi) q[0], q[5];\n",
+        )
+        for qasm in cases:
+            with self.assertRaisesRegex(ParseError, r"line 3:"):
+                parse_circuit(qasm, "bad")
+
+    def test_unbound_u3_is_a_validation_error(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nu3(theta, phi, lam) q[0];\n"
+        self.service.create_circuit({"id": "u", "qasm": qasm}, self.key())
+        with self.assertRaisesRegex(ValidationError, "unbound parameter"):
+            self.service.simulate("u", {"shots": 10}, self.key())
+        with self.assertRaisesRegex(ValidationError, "unbound parameter"):
+            self.service.get_statevector("u")
+
+    def test_u3_batch_and_noise(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[2];\n"
+            "h q[0];\ncu3(theta, 0, pi) q[0], q[1];\n"
+        )
+        self.service.create_circuit({"id": "cu", "qasm": qasm}, self.key())
+        quiet = self.service.simulate(
+            "cu",
+            {"shots": 100, "seed": 4, "parameters": {"theta": [0.0, math.pi]}},
+            self.key(),
+        )
+        self.assertEqual(2, quiet["scenario_count"])
+        # cu3(pi,0,pi) flips the target when the control is 1: scenario 1 entangles
+        self.assertGreater(quiet["scenarios"][1]["counts"].get("11", 0), 0)
+        noisy = self.service.simulate(
+            "cu",
+            {
+                "shots": 50,
+                "seed": 2,
+                "noise": {"type": "depolarizing", "probability": 0.1},
+                "parameters": {"theta": [0.0, math.pi]},
+            },
+            self.key(),
+        )
+        self.assertEqual(0.1, noisy["noise"]["probability"])
+        for scenario in noisy["scenarios"]:
+            self.assertEqual(50, sum(scenario["counts"].values()))
+
+    def test_u3_noise_matches_statevector_at_zero_probability(self):
+        qasm = "OPENQASM 2.0;\nqreg q[2];\nh q[0];\ncu3(0.4, 0.5, 0.6) q[0], q[1];\n"
+        self.service.create_circuit({"id": "n", "qasm": qasm}, self.key())
+        quiet = self.service.simulate("n", {"shots": 40, "seed": 5}, self.key())
+        noisy = self.service.simulate(
+            "n",
+            {"shots": 40, "seed": 5, "noise": {"type": "depolarizing", "probability": 0.0}},
+            self.key(),
+        )
+        self.assertEqual(quiet["probabilities"], noisy["probabilities"])
+        self.assertEqual(quiet["counts"], noisy["counts"])
+
+
 if __name__ == "__main__":
     unittest.main()

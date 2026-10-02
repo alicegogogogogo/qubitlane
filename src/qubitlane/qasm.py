@@ -9,6 +9,8 @@ that names the 1-based source line.
     creg name[n];
     h|x|y|z|s|t q[i];
     rx|ry|rz(theta) q[i];
+    u3(theta, phi, lambda) q[i];
+    cu3(theta, phi, lambda) q[control], q[target];
     cx|cz q[control], q[target];
     measure q[i] -> c[j];
 
@@ -32,8 +34,9 @@ MAX_CLBITS = 64
 
 SINGLE_QUBIT_GATES = ("h", "x", "y", "z", "s", "t")
 PARAMETER_GATES = ("rx", "ry", "rz")
+U3_GATES = ("u3", "cu3")
 TWO_QUBIT_GATES = ("cx", "cz")
-GATES = SINGLE_QUBIT_GATES + PARAMETER_GATES + TWO_QUBIT_GATES
+GATES = SINGLE_QUBIT_GATES + PARAMETER_GATES + U3_GATES + TWO_QUBIT_GATES
 
 QUBIT = r"q\[(\d+)\]"
 CLBIT = r"c\[(\d+)\]"
@@ -45,6 +48,8 @@ _CREG = re.compile(r"^creg\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[(\d+)\]$")
 _PARAMETER_GATE = re.compile(
     rf"^(rx|ry|rz)\s*\(\s*([^()]*)\s*\)\s+{QUBIT}$"
 )
+_U3_GATE = re.compile(rf"^u3\s*\(\s*([^()]*?)\s*\)\s+{QUBIT}$")
+_CU3_GATE = re.compile(rf"^cu3\s*\(\s*([^()]*?)\s*\)\s+{QUBIT}\s*,\s*{QUBIT}$")
 _TWO_QUBIT_GATE = re.compile(rf"^(cx|cz)\s+{QUBIT}\s*,\s*{QUBIT}$")
 _SINGLE_QUBIT_GATE = re.compile(rf"^(h|x|y|z|s|t)\s+{QUBIT}$")
 _MEASURE = re.compile(rf"^measure\s+{QUBIT}\s*->\s*{CLBIT}$")
@@ -104,7 +109,11 @@ def _evaluate(node: tuple, bindings: dict[str, float]) -> float:
 
 @dataclass(frozen=True)
 class Operation:
-    """One executable statement of the circuit."""
+    """One executable statement of the circuit.
+
+    Single-angle gates (`rx`/`ry`/`rz`) carry `angle`/`expression`; the three
+    angles of `u3`/`cu3` carry `angles`/`expressions`, in declaration order.
+    """
 
     kind: str  # "gate" or "measure"
     name: str  # gate name, or "measure"
@@ -113,10 +122,19 @@ class Operation:
     clbit: int | None = None
     line: int = 0
     expression: AngleExpression | None = None
+    angles: tuple[float, ...] | None = None
+    expressions: tuple[AngleExpression, ...] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": self.name, "targets": list(self.targets)}
-        if self.angle is not None:
+        if self.expressions is not None:
+            payload["angles"] = [
+                expression.evaluate({}) if expression.is_constant else expression.text
+                for expression in self.expressions
+            ]
+        elif self.angles is not None:
+            payload["angles"] = list(self.angles)
+        elif self.angle is not None:
             payload["angle"] = self.angle
         if self.expression is not None:
             payload["expression"] = self.expression.text
@@ -165,17 +183,7 @@ class Circuit:
         """
 
         operations = tuple(
-            Operation(
-                operation.kind,
-                operation.name,
-                operation.targets,
-                angle=operation.expression.evaluate(values),
-                clbit=operation.clbit,
-                line=operation.line,
-            )
-            if operation.expression is not None
-            else operation
-            for operation in self.operations
+            self._bind_operation(operation, values) for operation in self.operations
         )
         return Circuit(
             id=self.id,
@@ -186,6 +194,30 @@ class Circuit:
             source_lines=self.source_lines,
             measurements=self.measurements,
         )
+
+    @staticmethod
+    def _bind_operation(operation: Operation, values: dict[str, float]) -> Operation:
+        if operation.expressions is not None:
+            return Operation(
+                operation.kind,
+                operation.name,
+                operation.targets,
+                angles=tuple(
+                    expression.evaluate(values) for expression in operation.expressions
+                ),
+                clbit=operation.clbit,
+                line=operation.line,
+            )
+        if operation.expression is not None:
+            return Operation(
+                operation.kind,
+                operation.name,
+                operation.targets,
+                angle=operation.expression.evaluate(values),
+                clbit=operation.clbit,
+                line=operation.line,
+            )
+        return operation
 
 
 def identifier(value: Any, field: str) -> str:
@@ -440,8 +472,13 @@ def parse_circuit(qasm: str, circuit_id: str) -> Circuit:
         operations.append(operation)
         if operation.kind == "measure" and operation.clbit is not None:
             measurements.append((operation.targets[0], operation.clbit))
-        if operation.expression is not None:
-            for name in operation.expression.names:
+        angle_expressions: tuple[AngleExpression, ...] = ()
+        if operation.expressions is not None:
+            angle_expressions = operation.expressions
+        elif operation.expression is not None:
+            angle_expressions = (operation.expression,)
+        for angle_expression in angle_expressions:
+            for name in angle_expression.names:
                 if name not in parameters:
                     parameters.append(name)
 
@@ -484,6 +521,21 @@ def _parse_operation(text: str, line: int, qubits: int, clbits: int) -> Operatio
             "gate", parameter.group(1), (target,), expression=expression, line=line
         )
 
+    u3 = _U3_GATE.match(text)
+    if u3:
+        expressions = _parse_three_angles(u3.group(1), line, "u3")
+        target = _checked_bit(int(u3.group(2)), qubits, "qubit", line)
+        return _u3_operation("u3", (target,), expressions, line)
+
+    cu3 = _CU3_GATE.match(text)
+    if cu3:
+        expressions = _parse_three_angles(cu3.group(1), line, "cu3")
+        control = _checked_bit(int(cu3.group(2)), qubits, "qubit", line)
+        target = _checked_bit(int(cu3.group(3)), qubits, "qubit", line)
+        if control == target:
+            raise ParseError(f"line {line}: cu3 requires two distinct qubits")
+        return _u3_operation("cu3", (control, target), expressions, line)
+
     two_qubit = _TWO_QUBIT_GATE.match(text)
     if two_qubit:
         control = _checked_bit(int(two_qubit.group(2)), qubits, "qubit", line)
@@ -503,6 +555,40 @@ def _parse_operation(text: str, line: int, qubits: int, clbits: int) -> Operatio
     if name in GATES:
         raise ParseError(f"line {line}: malformed {name} statement {text!r}")
     raise ParseError(f"line {line}: unsupported statement or gate {text!r}")
+
+
+def _split_angles(body: str, line: int, gate: str) -> list[str]:
+    """Split a gate's angle list on top-level commas (no nested parentheses)."""
+
+    parts = [part.strip() for part in body.split(",")]
+    if len(parts) != 3 or any(not part for part in parts):
+        raise ParseError(f"line {line}: {gate} requires exactly three angles")
+    return parts
+
+
+def _parse_three_angles(body: str, line: int, gate: str) -> tuple[AngleExpression, ...]:
+    """Parse the `theta, phi, lambda` angle list of a `u3`/`cu3` statement."""
+
+    return tuple(parse_angle(part, line) for part in _split_angles(body, line, gate))
+
+
+def _u3_operation(
+    name: str,
+    targets: tuple[int, ...],
+    expressions: tuple[AngleExpression, ...],
+    line: int,
+) -> Operation:
+    """Build a `u3`/`cu3` operation, folding an all-constant angle list."""
+
+    if all(expression.is_constant for expression in expressions):
+        return Operation(
+            "gate",
+            name,
+            targets,
+            angles=tuple(expression.evaluate({}) for expression in expressions),
+            line=line,
+        )
+    return Operation("gate", name, targets, expressions=expressions, line=line)
 
 
 def _checked_bit(value: int, size: int, label: str, line: int) -> int:
