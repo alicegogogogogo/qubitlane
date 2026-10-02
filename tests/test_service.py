@@ -3,7 +3,18 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from qubitlane.errors import ConflictError, NotFoundError, ParseError, ValidationError
+from qubitlane.errors import (
+    BatchLimitExceededError,
+    ConflictError,
+    NotFoundError,
+    ParamArrayEmptyError,
+    ParamArrayLengthMismatchError,
+    ParamUndefinedError,
+    ParamValueInvalidError,
+    ParseError,
+    ShotsInvalidError,
+    ValidationError,
+)
 from qubitlane.qasm import parse_circuit
 from qubitlane.service import QubitLane
 from qubitlane.simulator import (
@@ -427,6 +438,262 @@ class NoiseTests(unittest.TestCase):
     def test_noisy_simulation_of_unknown_circuit_is_not_found(self):
         with self.assertRaises(NotFoundError):
             self.service.simulate("missing", {"noise": self.noise()}, self.key())
+
+
+PARAMETER_QASM = """OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[1];
+creg c[1];
+rx(theta) q[0];
+measure q[0] -> c[0];
+"""
+
+
+class BatchTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = QubitLane(str(Path(self.directory.name) / "qubitlane.db"))
+        self.counter = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def key(self, prefix: str = "k") -> str:
+        self.counter += 1
+        return f"{prefix}-{self.counter}"
+
+    def create_parameter_circuit(self, qasm: str = PARAMETER_QASM, circuit_id: str = "sweep"):
+        return self.service.create_circuit({"id": circuit_id, "qasm": qasm}, self.key())
+
+    def job_count(self) -> int:
+        row = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM jobs"
+        ).fetchone()
+        return row["n"]
+
+    def test_parameterized_circuit_document(self):
+        document = self.create_parameter_circuit()
+        self.assertEqual(["theta"], document["parameters"])
+        (operation,) = [
+            operation for operation in document["operations"] if operation["name"] == "rx"
+        ]
+        self.assertEqual("theta", operation["expression"])
+        self.assertNotIn("angle", operation)
+
+    def test_angle_expression_forms(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[1];\n"
+            "rx(theta/2 + pi) q[0];\nry(2*phi) q[0];\nrz(-phi) q[0];\n"
+        )
+        circuit = parse_circuit(qasm, "expr")
+        self.assertEqual(("theta", "phi"), circuit.parameters)
+        bound = circuit.bind({"theta": math.pi, "phi": 0.25})
+        rx, ry, rz = bound.operations
+        self.assertAlmostEqual(1.5 * math.pi, rx.angle, places=12)
+        self.assertAlmostEqual(0.5, ry.angle, places=12)
+        self.assertAlmostEqual(-0.25, rz.angle, places=12)
+
+    def test_batch_scenarios_are_indexed_in_order(self):
+        self.create_parameter_circuit()
+        job = self.service.simulate(
+            "sweep",
+            {"shots": 100, "seed": 5, "parameters": {"theta": [0.0, math.pi, 2 * math.pi]}},
+            self.key(),
+        )
+        self.assertEqual("completed", job["state"])
+        self.assertEqual("sweep", job["circuit_id"])
+        self.assertEqual(100, job["shots"])
+        self.assertEqual(5, job["seed"])
+        self.assertEqual(["theta"], job["parameters"])
+        self.assertEqual(3, job["scenario_count"])
+        self.assertEqual([0, 1, 2], [scenario["index"] for scenario in job["scenarios"]])
+        self.assertEqual(
+            [{"theta": 0.0}, {"theta": math.pi}, {"theta": 2 * math.pi}],
+            [scenario["values"] for scenario in job["scenarios"]],
+        )
+        for scenario in job["scenarios"]:
+            self.assertEqual(100, sum(scenario["counts"].values()))
+        # rx(0) keeps |0>, rx(pi) flips to |1>, rx(2*pi) returns to |0>
+        self.assertEqual({"0": 100}, job["scenarios"][0]["counts"])
+        self.assertEqual({"1": 100}, job["scenarios"][1]["counts"])
+        self.assertEqual({"0": 100}, job["scenarios"][2]["counts"])
+
+    def test_batch_is_deterministic_and_rereads_without_rerunning(self):
+        self.create_parameter_circuit()
+        body = {"shots": 200, "seed": 3, "parameters": {"theta": [0.1, 0.2, 0.3, 0.4]}}
+        first = self.service.simulate("sweep", body, self.key())
+        repeated = self.service.simulate("sweep", body, self.key())
+        self.assertEqual(first, repeated)
+        self.assertEqual(first, self.service.get_job(first["id"]))
+        other_seed = self.service.simulate("sweep", {**body, "seed": 4}, self.key())
+        self.assertNotEqual(first["id"], other_seed["id"])
+        self.assertEqual(
+            [scenario["values"] for scenario in first["scenarios"]],
+            [scenario["values"] for scenario in other_seed["scenarios"]],
+        )
+
+    def test_single_scenario_matches_the_plain_job(self):
+        self.create_parameter_circuit()
+        fixed = PARAMETER_QASM.replace("rx(theta)", "rx(0.7)")
+        self.service.create_circuit({"id": "fixed", "qasm": fixed}, self.key())
+        plain = self.service.simulate("fixed", {"shots": 300, "seed": 11}, self.key())
+        batch = self.service.simulate(
+            "sweep",
+            {"shots": 300, "seed": 11, "parameters": {"theta": [0.7]}},
+            self.key(),
+        )
+        self.assertEqual(1, batch["scenario_count"])
+        self.assertEqual(plain["counts"], batch["scenarios"][0]["counts"])
+        self.assertNotEqual(plain["id"], batch["id"])
+
+    def test_parameter_names_must_resolve(self):
+        self.create_parameter_circuit()
+        with self.assertRaises(ParamUndefinedError) as caught:
+            self.service.simulate(
+                "sweep", {"parameters": {"omega": [0.1]}}, self.key()
+            )
+        self.assertEqual("PARAM_UNDEFINED", caught.exception.code)
+        with self.assertRaises(ParamUndefinedError):
+            self.service.simulate(
+                "sweep",
+                {"parameters": {"theta": [0.1], "omega": [0.1]}},
+                self.key(),
+            )
+        self.assertEqual(0, self.job_count())
+
+    def test_missing_binding_is_param_undefined(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nrx(theta) q[0];\nry(phi) q[0];\n"
+        self.create_parameter_circuit(qasm, "two")
+        with self.assertRaises(ParamUndefinedError):
+            self.service.simulate("two", {"parameters": {"theta": [0.1]}}, self.key())
+        self.assertEqual(0, self.job_count())
+
+    def test_plain_circuit_rejects_bindings(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        with self.assertRaises(ParamUndefinedError):
+            self.service.simulate(
+                "bell", {"parameters": {"theta": [0.1]}}, self.key()
+            )
+        self.assertEqual(0, self.job_count())
+
+    def test_parameter_array_validation(self):
+        self.create_parameter_circuit()
+        with self.assertRaises(ParamArrayEmptyError) as caught:
+            self.service.simulate("sweep", {"parameters": {"theta": []}}, self.key())
+        self.assertEqual("PARAM_ARRAY_EMPTY", caught.exception.code)
+        with self.assertRaisesRegex(ValidationError, "array of numbers"):
+            self.service.simulate("sweep", {"parameters": {"theta": 0.1}}, self.key())
+        with self.assertRaisesRegex(ValidationError, "JSON object"):
+            self.service.simulate("sweep", {"parameters": [0.1]}, self.key())
+        self.assertEqual(0, self.job_count())
+
+    def test_multi_parameter_length_mismatch(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nrx(theta) q[0];\nry(phi) q[0];\n"
+        self.create_parameter_circuit(qasm, "two")
+        with self.assertRaises(ParamArrayLengthMismatchError):
+            self.service.simulate(
+                "two",
+                {"parameters": {"theta": [0.1, 0.2], "phi": [0.3]}},
+                self.key(),
+            )
+        self.assertEqual(0, self.job_count())
+
+    def test_parameter_values_must_be_finite_numbers(self):
+        self.create_parameter_circuit()
+        for bad in (float("nan"), float("inf"), float("-inf"), "0.1", True, None):
+            with self.assertRaises(ParamValueInvalidError) as caught:
+                self.service.simulate(
+                    "sweep", {"parameters": {"theta": [bad]}}, self.key()
+                )
+            self.assertEqual("PARAM_VALUE_INVALID", caught.exception.code)
+        self.assertEqual(0, self.job_count())
+
+    def test_batch_shots_must_be_a_positive_integer(self):
+        self.create_parameter_circuit()
+        for bad in (0, -3, 1.5, True, "10"):
+            with self.assertRaises(ShotsInvalidError) as caught:
+                self.service.simulate(
+                    "sweep",
+                    {"shots": bad, "parameters": {"theta": [0.1]}},
+                    self.key(),
+                )
+            self.assertEqual("SHOTS_INVALID", caught.exception.code)
+        self.assertEqual(0, self.job_count())
+
+    def test_batch_limit_is_enforced_before_any_job_exists(self):
+        self.create_parameter_circuit()
+        with self.assertRaises(BatchLimitExceededError) as caught:
+            self.service.simulate(
+                "sweep",
+                {"shots": 60_000, "parameters": {"theta": [0.1, 0.2]}},
+                self.key(),
+            )
+        self.assertEqual("BATCH_LIMIT_EXCEEDED", caught.exception.code)
+        with self.assertRaises(BatchLimitExceededError):
+            self.service.simulate(
+                "sweep",
+                {"shots": 100_001, "parameters": {"theta": [0.1]}},
+                self.key(),
+            )
+        self.assertEqual(0, self.job_count())
+        # exactly at the limit is accepted
+        job = self.service.simulate(
+            "sweep",
+            {"shots": 50_000, "parameters": {"theta": [0.1, 0.2]}},
+            self.key(),
+        )
+        self.assertEqual(2, job["scenario_count"])
+
+    def test_batch_errors_do_not_consume_the_idempotency_key(self):
+        self.create_parameter_circuit()
+        with self.assertRaises(ParamArrayEmptyError):
+            self.service.simulate("sweep", {"parameters": {"theta": []}}, "reuse")
+        job = self.service.simulate(
+            "sweep", {"parameters": {"theta": [0.1]}}, "reuse"
+        )
+        self.assertEqual(1, job["scenario_count"])
+
+    def test_plain_simulation_is_unchanged_without_bindings(self):
+        self.service.create_circuit(circuit_document(BELL, "bell"), self.key())
+        job = self.service.simulate("bell", {"shots": 10, "seed": 1}, self.key())
+        self.assertIn("probabilities", job)
+        self.assertIn("counts", job)
+        self.assertNotIn("scenarios", job)
+        self.assertNotIn("parameters", job)
+
+    def test_unbound_parameterized_circuit_is_a_validation_error(self):
+        self.create_parameter_circuit()
+        with self.assertRaisesRegex(ValidationError, "unbound parameter"):
+            self.service.simulate("sweep", {"shots": 10}, self.key())
+        with self.assertRaisesRegex(ValidationError, "unbound parameter"):
+            self.service.get_statevector("sweep")
+
+    def test_batch_with_noise(self):
+        self.create_parameter_circuit()
+        job = self.service.simulate(
+            "sweep",
+            {
+                "shots": 50,
+                "seed": 2,
+                "noise": {"type": "depolarizing", "probability": 0.1},
+                "parameters": {"theta": [0.0, math.pi]},
+            },
+            self.key(),
+        )
+        self.assertEqual({"type": "depolarizing", "probability": 0.1}, job["noise"])
+        self.assertEqual(2, job["scenario_count"])
+        for scenario in job["scenarios"]:
+            self.assertEqual(50, sum(scenario["counts"].values()))
+
+    def test_batch_job_survives_a_new_service_instance(self):
+        path = str(Path(self.directory.name) / "shared.db")
+        first = QubitLane(path)
+        first.create_circuit({"id": "sweep", "qasm": PARAMETER_QASM}, self.key())
+        job = first.simulate(
+            "sweep", {"shots": 20, "parameters": {"theta": [0.0, 1.0]}}, self.key()
+        )
+        second = QubitLane(path)
+        self.assertEqual(job, second.get_job(job["id"]))
 
 
 if __name__ == "__main__":

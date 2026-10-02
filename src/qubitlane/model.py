@@ -7,15 +7,24 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from .errors import ValidationError
+from .errors import (
+    ParamArrayEmptyError,
+    ParamArrayLengthMismatchError,
+    ParamValueInvalidError,
+    ShotsInvalidError,
+    ValidationError,
+)
 from .qasm import identifier
 
 MAX_QASM_BYTES = 64 * 1024
 MAX_SHOTS = 100_000
 MAX_SEED = (1 << 63) - 1
+MAX_BATCH_TOTAL_SHOTS = MAX_SHOTS
 
 DEFAULT_SHOTS = 1024
 DEFAULT_SEED = 0
+
+PARAMETER_FIELDS = ("parameters", "parameter_bindings", "bindings")
 
 
 def _require_object(raw: Any, label: str) -> dict[str, Any]:
@@ -44,6 +53,56 @@ def _seed(value: Any) -> int:
     if value < 0 or value > MAX_SEED:
         raise ValidationError(f"seed must be between 0 and {MAX_SEED}")
     return value
+
+
+def _batch_shots(value: Any) -> int:
+    """Shots for a parameter sweep: any positive integer is syntactically valid.
+
+    The total work is bounded separately by the batch limit, so a rejected
+    value here is exactly one that is not a positive integer.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ShotsInvalidError("shots must be an integer")
+    if value < 1:
+        raise ShotsInvalidError("shots must be a positive integer")
+    return value
+
+
+def _parameters(value: Any) -> dict[str, list[float]]:
+    """Validate a `name -> non-empty numeric array` binding map."""
+
+    if not isinstance(value, dict):
+        raise ValidationError("parameters must be a JSON object")
+    if not value:
+        raise ValidationError("parameters must bind at least one parameter")
+    bindings: dict[str, list[float]] = {}
+    length: int | None = None
+    for name, array in value.items():
+        if not isinstance(array, list):
+            raise ValidationError(f"parameter {name!r} must be an array of numbers")
+        if not array:
+            raise ParamArrayEmptyError(f"parameter {name!r} must not be an empty array")
+        values: list[float] = []
+        for element in array:
+            if isinstance(element, bool) or not isinstance(element, (int, float)):
+                raise ParamValueInvalidError(
+                    f"parameter {name!r} must contain only numbers"
+                )
+            element = float(element)
+            if not math.isfinite(element):
+                raise ParamValueInvalidError(
+                    f"parameter {name!r} must contain only finite numbers"
+                )
+            values.append(element)
+        if length is None:
+            length = len(values)
+        elif len(values) != length:
+            raise ParamArrayLengthMismatchError(
+                "all parameter arrays must have the same length"
+            )
+        bindings[name] = values
+    return bindings
 
 
 @dataclass(frozen=True)
@@ -113,14 +172,25 @@ class SimulationRequest:
     shots: int
     seed: int
     noise: NoiseSpec | None = None
+    parameters: dict[str, list[float]] | None = None
 
     @classmethod
     def parse(cls, raw: Any) -> "SimulationRequest":
         if raw is None:
             return cls(DEFAULT_SHOTS, DEFAULT_SEED)
         body = _require_object(raw, "simulation")
-        _reject_unknown(body, {"shots", "seed", "noise"}, "simulation request")
-        shots = _shots(body["shots"]) if "shots" in body else DEFAULT_SHOTS
+        _reject_unknown(
+            body, {"shots", "seed", "noise", *PARAMETER_FIELDS}, "simulation request"
+        )
+        aliases = [field for field in PARAMETER_FIELDS if field in body]
+        if len(aliases) > 1:
+            raise ValidationError("parameter bindings must be provided only once")
+        is_batch = bool(aliases)
+        if "shots" in body:
+            shots = _batch_shots(body["shots"]) if is_batch else _shots(body["shots"])
+        else:
+            shots = DEFAULT_SHOTS
         seed = _seed(body["seed"]) if "seed" in body else DEFAULT_SEED
         noise = _noise(body["noise"]) if "noise" in body else None
-        return cls(shots, seed, noise)
+        parameters = _parameters(body[aliases[0]]) if is_batch else None
+        return cls(shots, seed, noise, parameters)

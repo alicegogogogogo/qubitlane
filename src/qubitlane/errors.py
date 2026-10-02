@@ -23,3 +23,31 @@ class NotFoundError(QubitLaneError):
 class ConflictError(QubitLaneError):
     code = "conflict"
     status = 409
+
+
+class BatchError(ValidationError):
+    """A rejected parameter-sweep submission; still a 400 validation failure."""
+
+
+class ShotsInvalidError(BatchError):
+    code = "SHOTS_INVALID"
+
+
+class ParamUndefinedError(BatchError):
+    code = "PARAM_UNDEFINED"
+
+
+class ParamArrayLengthMismatchError(BatchError):
+    code = "PARAM_ARRAY_LENGTH_MISMATCH"
+
+
+class ParamArrayEmptyError(BatchError):
+    code = "PARAM_ARRAY_EMPTY"
+
+
+class ParamValueInvalidError(BatchError):
+    code = "PARAM_VALUE_INVALID"
+
+
+class BatchLimitExceededError(BatchError):
+    code = "BATCH_LIMIT_EXCEEDED"

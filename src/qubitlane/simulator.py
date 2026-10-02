@@ -55,6 +55,11 @@ def _apply_single_qubit(state: list[complex], operation: Operation, qubits: int)
     mask = 1 << target
     angle = operation.angle
     name = operation.name
+    if name in ("rx", "ry", "rz") and angle is None:
+        raise ValidationError(
+            f"gate {name} has an unbound parameter; "
+            "simulate the circuit with parameter bindings"
+        )
     for index in range(len(state)):
         if index & mask:
             continue
@@ -133,6 +138,11 @@ def _gate_matrix(operation: Operation) -> tuple[tuple[complex, ...], ...]:
     """The unitary of one gate, matching `_apply_single_qubit`/`_apply_controlled`."""
 
     name = operation.name
+    if name in ("rx", "ry", "rz") and operation.angle is None:
+        raise ValidationError(
+            f"gate {name} has an unbound parameter; "
+            "simulate the circuit with parameter bindings"
+        )
     if name == "h":
         return ((_SQRT_HALF, _SQRT_HALF), (_SQRT_HALF, -_SQRT_HALF))
     if name == "x":

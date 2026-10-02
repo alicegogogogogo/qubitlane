@@ -11,6 +11,11 @@ that names the 1-based source line.
     rx|ry|rz(theta) q[i];
     cx|cz q[control], q[target];
     measure q[i] -> c[j];
+
+Gate angles may also be parameter expressions: identifiers such as `theta`
+mixed with numbers, `pi`, and the `+ - * /` operators, for example
+`rx(theta/2 + pi)` — such circuits are executed after binding every
+parameter to a concrete value.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .errors import ParseError, ValidationError
+from .errors import ParamValueInvalidError, ParseError, ValidationError
 
 MAX_QUBITS = 16
 MAX_CLBITS = 64
@@ -51,6 +56,53 @@ _PI = re.compile(r"^[+-]?pi$")
 
 
 @dataclass(frozen=True)
+class AngleExpression:
+    """A gate angle that may mention named parameters.
+
+    `node` is a tiny AST of tuples: `("const", value)`, `("name", identifier)`,
+    `("add"|"sub"|"mul"|"div", left, right)`, or `("neg", operand)`.
+    """
+
+    text: str
+    names: tuple[str, ...]
+    node: tuple
+
+    @property
+    def is_constant(self) -> bool:
+        return not self.names
+
+    def evaluate(self, bindings: dict[str, float]) -> float:
+        try:
+            value = _evaluate(self.node, bindings)
+        except (ArithmeticError, OverflowError):
+            value = math.inf
+        if not math.isfinite(value):
+            raise ParamValueInvalidError(
+                f"angle expression {self.text!r} does not evaluate to a finite number"
+            )
+        return value
+
+
+def _evaluate(node: tuple, bindings: dict[str, float]) -> float:
+    kind = node[0]
+    if kind == "const":
+        return node[1]
+    if kind == "name":
+        return float(bindings[node[1]])
+    if kind == "neg":
+        return -_evaluate(node[1], bindings)
+    left = _evaluate(node[1], bindings)
+    right = _evaluate(node[2], bindings)
+    if kind == "add":
+        return left + right
+    if kind == "sub":
+        return left - right
+    if kind == "mul":
+        return left * right
+    return left / right
+
+
+@dataclass(frozen=True)
 class Operation:
     """One executable statement of the circuit."""
 
@@ -60,11 +112,14 @@ class Operation:
     angle: float | None = None
     clbit: int | None = None
     line: int = 0
+    expression: AngleExpression | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": self.name, "targets": list(self.targets)}
         if self.angle is not None:
             payload["angle"] = self.angle
+        if self.expression is not None:
+            payload["expression"] = self.expression.text
         if self.clbit is not None:
             payload["clbit"] = self.clbit
         return payload
@@ -81,9 +136,10 @@ class Circuit:
     qasm: str
     source_lines: int
     measurements: tuple[tuple[int, int], ...] = field(default=())
+    parameters: tuple[str, ...] = field(default=())
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        document = {
             "id": self.id,
             "name": self.id,
             "qubits": self.qubits,
@@ -96,6 +152,40 @@ class Circuit:
             "source_lines": self.source_lines,
             "qasm": self.qasm,
         }
+        if self.parameters:
+            document["parameters"] = list(self.parameters)
+        return document
+
+    def bind(self, values: dict[str, float]) -> "Circuit":
+        """Resolve every parameter expression against `values`.
+
+        The result is a circuit whose operations carry only concrete angles,
+        ready for the simulator. Unbound names raise `KeyError` from the
+        expression; non-finite results raise `PARAM_VALUE_INVALID`.
+        """
+
+        operations = tuple(
+            Operation(
+                operation.kind,
+                operation.name,
+                operation.targets,
+                angle=operation.expression.evaluate(values),
+                clbit=operation.clbit,
+                line=operation.line,
+            )
+            if operation.expression is not None
+            else operation
+            for operation in self.operations
+        )
+        return Circuit(
+            id=self.id,
+            qubits=self.qubits,
+            clbits=self.clbits,
+            operations=operations,
+            qasm=self.qasm,
+            source_lines=self.source_lines,
+            measurements=self.measurements,
+        )
 
 
 def identifier(value: Any, field: str) -> str:
@@ -137,6 +227,139 @@ def parse_number(text: str, line: int) -> float:
     if not math.isfinite(value):
         raise ParseError(f"line {line}: angle must be finite")
     return sign * value
+
+
+_ANGLE_TOKEN = re.compile(
+    r"\s*(?:(?P<number>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"|(?P<name>[A-Za-z_][A-Za-z0-9_]*)"
+    r"|(?P<op>[+\-*/]))"
+)
+
+
+def parse_angle(text: str, line: int) -> AngleExpression:
+    """Parse a gate angle into an `AngleExpression`.
+
+    Accepts everything `parse_number` accepts plus parameter identifiers and
+    flat `+ - * /` arithmetic, for example `theta`, `2*theta`, or
+    `theta/2 + pi`. A single leading sign is allowed; parentheses are not
+    part of the grammar.
+    """
+
+    candidate = text.strip()
+    if not candidate:
+        raise ParseError(f"line {line}: angle is missing")
+    tokens: list[tuple[str, str]] = []
+    position = 0
+    while position < len(candidate):
+        match = _ANGLE_TOKEN.match(candidate, position)
+        if not match or match.end() == position:
+            raise ParseError(
+                f"line {line}: angle {candidate!r} is not a numeric expression"
+            )
+        position = match.end()
+        if match.lastgroup == "number":
+            tokens.append(("number", match.group("number")))
+        elif match.lastgroup == "name":
+            tokens.append(("name", match.group("name")))
+        else:
+            tokens.append(("op", match.group("op")))
+
+    index = 0
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[index] if index < len(tokens) else None
+
+    def advance() -> tuple[str, str]:
+        nonlocal index
+        token = tokens[index]
+        index += 1
+        return token
+
+    def invalid() -> ParseError:
+        return ParseError(f"line {line}: angle {candidate!r} is not a numeric expression")
+
+    def factor() -> tuple:
+        token = peek()
+        if token is None:
+            raise invalid()
+        kind, value = advance()
+        if kind == "number":
+            number = float(value)
+            if not math.isfinite(number):
+                raise ParseError(f"line {line}: angle must be finite")
+            return ("const", number)
+        if kind == "name":
+            if value == "pi":
+                return ("const", math.pi)
+            return ("name", value)
+        raise invalid()
+
+    def term() -> tuple:
+        node = factor()
+        while peek() is not None and peek() in (("op", "*"), ("op", "/")):
+            operator = advance()[1]
+            right = factor()
+            node = _fold(operator, node, right, line, candidate)
+        return node
+
+    def expression() -> tuple:
+        sign = ("op", "+")
+        if peek() is not None and peek() in (("op", "+"), ("op", "-")):
+            sign = advance()
+            if peek() is not None and peek() in (("op", "+"), ("op", "-")):
+                raise ParseError(
+                    f"line {line}: angle {candidate!r} has a repeated sign"
+                )
+        node = term()
+        if sign == ("op", "-"):
+            node = _fold("neg", node, None, line, candidate)
+        while peek() is not None and peek() in (("op", "+"), ("op", "-")):
+            operator = advance()[1]
+            right = term()
+            node = _fold(operator, node, right, line, candidate)
+        return node
+
+    node = expression()
+    if peek() is not None:
+        raise invalid()
+
+    names: list[str] = []
+
+    def collect(current: tuple) -> None:
+        if current[0] == "name" and current[1] not in names:
+            names.append(current[1])
+        for child in current[1:]:
+            if isinstance(child, tuple):
+                collect(child)
+
+    collect(node)
+    return AngleExpression(candidate, tuple(names), node)
+
+
+def _fold(operator: str, left: tuple, right: tuple | None, line: int, text: str) -> tuple:
+    """Constant-fold one operator node, rejecting non-finite constants."""
+
+    operands = (left,) if right is None else (left, right)
+    if all(operand[0] == "const" for operand in operands):
+        if operator == "neg":
+            return ("const", -left[1])
+        a, b = left[1], right[1]
+        if operator == "+":
+            value = a + b
+        elif operator == "-":
+            value = a - b
+        elif operator == "*":
+            value = a * b
+        else:
+            if b == 0:
+                raise ParseError(f"line {line}: division by zero in angle expression")
+            value = a / b
+        if not math.isfinite(value):
+            raise ParseError(f"line {line}: angle must be finite")
+        return ("const", value)
+    if operator == "neg":
+        return ("neg", left)
+    return ({"+": "add", "-": "sub", "*": "mul", "/": "div"}[operator], left, right)
 
 
 def statements(qasm: str) -> list[tuple[int, str]]:
@@ -211,11 +434,16 @@ def parse_circuit(qasm: str, circuit_id: str) -> Circuit:
 
     operations: list[Operation] = []
     measurements: list[tuple[int, int]] = []
+    parameters: list[str] = []
     for line, text in entries[index:]:
         operation = _parse_operation(text, line, qubits, clbits)
         operations.append(operation)
         if operation.kind == "measure" and operation.clbit is not None:
             measurements.append((operation.targets[0], operation.clbit))
+        if operation.expression is not None:
+            for name in operation.expression.names:
+                if name not in parameters:
+                    parameters.append(name)
 
     if not operations:
         raise ValidationError("qasm must contain at least one gate or measure statement")
@@ -227,6 +455,7 @@ def parse_circuit(qasm: str, circuit_id: str) -> Circuit:
         qasm=qasm,
         source_lines=len(qasm.splitlines()),
         measurements=tuple(measurements),
+        parameters=tuple(parameters),
     )
 
 
@@ -241,9 +470,19 @@ def _parse_operation(text: str, line: int, qubits: int, clbits: int) -> Operatio
 
     parameter = _PARAMETER_GATE.match(text)
     if parameter:
-        angle = parse_number(parameter.group(2), line)
+        expression = parse_angle(parameter.group(2), line)
         target = _checked_bit(int(parameter.group(3)), qubits, "qubit", line)
-        return Operation("gate", parameter.group(1), (target,), angle=angle, line=line)
+        if expression.is_constant:
+            return Operation(
+                "gate",
+                parameter.group(1),
+                (target,),
+                angle=expression.evaluate({}),
+                line=line,
+            )
+        return Operation(
+            "gate", parameter.group(1), (target,), expression=expression, line=line
+        )
 
     two_qubit = _TWO_QUBIT_GATE.match(text)
     if two_qubit:

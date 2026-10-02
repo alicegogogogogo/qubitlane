@@ -3,8 +3,14 @@ from __future__ import annotations
 import hashlib
 from typing import Any, Callable
 
-from .errors import ConflictError, NotFoundError, ValidationError
-from .model import CircuitRequest, SimulationRequest
+from .errors import (
+    BatchLimitExceededError,
+    ConflictError,
+    NotFoundError,
+    ParamUndefinedError,
+    ValidationError,
+)
+from .model import MAX_BATCH_TOTAL_SHOTS, CircuitRequest, SimulationRequest
 from .qasm import Circuit, identifier, parse_circuit
 from .simulator import (
     MAX_NOISE_QUBITS,
@@ -85,6 +91,9 @@ class QubitLane:
                 f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits"
             )
 
+        if request.parameters is not None:
+            return self._simulate_batch(circuit_id, request, key)
+
         job_id = self._job_id(circuit_id, request)
 
         def run() -> dict[str, Any]:
@@ -101,6 +110,49 @@ class QubitLane:
             return job
 
         return self._idempotent(key, f"simulate:{job_id}", run)
+
+    def _simulate_batch(
+        self, circuit_id: str, request: SimulationRequest, key: str | None
+    ) -> dict[str, Any]:
+        circuit = self._load(circuit_id)
+        self._resolve_bindings(circuit, request.parameters)
+        scenario_count = len(next(iter(request.parameters.values())))
+        if scenario_count * request.shots > MAX_BATCH_TOTAL_SHOTS:
+            raise BatchLimitExceededError(
+                f"{scenario_count} scenarios at {request.shots} shots each exceed "
+                f"the limit of {MAX_BATCH_TOTAL_SHOTS} total shots"
+            )
+
+        job_id = self._job_id(circuit_id, request)
+
+        def run() -> dict[str, Any]:
+            existing = self.store.connection.execute(
+                "SELECT document FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if existing:
+                return self.store.decode(existing["document"])
+            job = self._execute_batch(circuit, job_id, request)
+            self.store.connection.execute(
+                "INSERT INTO jobs(id, circuit_id, document) VALUES (?, ?, ?)",
+                (job_id, circuit_id, self.store.encode(job)),
+            )
+            return job
+
+        return self._idempotent(key, f"simulate:{job_id}", run)
+
+    @staticmethod
+    def _resolve_bindings(circuit: Circuit, parameters: dict[str, list[float]]) -> None:
+        for name in parameters:
+            if name not in circuit.parameters:
+                raise ParamUndefinedError(
+                    f"parameter {name!r} does not appear in the circuit's "
+                    "parameter expressions"
+                )
+        for name in circuit.parameters:
+            if name not in parameters:
+                raise ParamUndefinedError(
+                    f"parameter {name!r} is not bound by the request"
+                )
 
     def get_statevector(self, circuit_id: str) -> dict[str, Any]:
         identifier(circuit_id, "circuit id")
@@ -160,6 +212,50 @@ class QubitLane:
             job["noise"] = request.noise.as_dict()
         return job
 
+    def _execute_batch(
+        self, circuit: Circuit, job_id: str, request: SimulationRequest
+    ) -> dict[str, Any]:
+        names = list(request.parameters)
+        arrays = request.parameters
+        scenario_count = len(arrays[names[0]])
+        scenarios: list[dict[str, Any]] = []
+        for index in range(scenario_count):
+            values = {name: arrays[name][index] for name in names}
+            bound = circuit.bind(values)
+            if request.noise is not None:
+                rho = simulate_density(bound, request.noise.probability)
+                weights = density_probabilities(rho, bound.qubits)
+                assert_normalized_weights(weights)
+            else:
+                state = simulate(bound)
+                assert_normalized(state)
+                weights = probabilities(state)
+            sampler = Sampler(request.seed + index)
+            raw_counts = sampler.sample(weights, request.shots, bound.qubits)
+            counts = {
+                self._measured_key(bound, label): value
+                for label, value in raw_counts.items()
+            }
+            ordered = {key: counts[key] for key in sorted(counts)}
+            scenarios.append({"index": index, "values": values, "counts": ordered})
+        job = {
+            "id": job_id,
+            "circuit_id": circuit.id,
+            "state": "completed",
+            "shots": request.shots,
+            "seed": request.seed,
+            "qubits": circuit.qubits,
+            "bit_order": "little_endian",
+            "measured_bits": self._measured_bit_count(circuit),
+            "parameters": names,
+            "scenario_count": scenario_count,
+            "scenarios": scenarios,
+            "created_at": self.store.now(),
+        }
+        if request.noise is not None:
+            job["noise"] = request.noise.as_dict()
+        return job
+
     @staticmethod
     def _measured_bit_count(circuit: Circuit) -> int:
         if not circuit.measurements:
@@ -171,6 +267,12 @@ class QubitLane:
         raw = f"{circuit_id}|{request.shots}|{request.seed}"
         if request.noise is not None:
             raw += f"|{request.noise.type}|{request.noise.probability!r}"
+        if request.parameters is not None:
+            bindings = ",".join(
+                f"{name}={'/'.join(repr(value) for value in values)}"
+                for name, values in request.parameters.items()
+            )
+            raw += f"|params:{bindings}"
         return f"j-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
     @staticmethod
