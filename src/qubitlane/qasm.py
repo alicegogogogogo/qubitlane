@@ -9,13 +9,17 @@ that names the 1-based source line.
     creg name[n];
     h|x|y|z|s|t q[i];
     rx|ry|rz(theta) q[i];
+    u3(theta, phi, lambda) q[i];
     cx|cz q[control], q[target];
+    cu3(theta, phi, lambda) q[control], q[target];
     measure q[i] -> c[j];
 
 Gate angles may also be parameter expressions: identifiers such as `theta`
 mixed with numbers, `pi`, and the `+ - * /` operators, for example
 `rx(theta/2 + pi)` — such circuits are executed after binding every
-parameter to a concrete value.
+parameter to a concrete value. A `u3`/`cu3` gate carries three such angles
+in declaration order, each following the same number, `pi`, parameter, and
+arithmetic rules.
 """
 
 from __future__ import annotations
@@ -33,7 +37,8 @@ MAX_CLBITS = 64
 SINGLE_QUBIT_GATES = ("h", "x", "y", "z", "s", "t")
 PARAMETER_GATES = ("rx", "ry", "rz")
 TWO_QUBIT_GATES = ("cx", "cz")
-GATES = SINGLE_QUBIT_GATES + PARAMETER_GATES + TWO_QUBIT_GATES
+TRIPLE_ANGLE_GATES = ("u3", "cu3")
+GATES = SINGLE_QUBIT_GATES + PARAMETER_GATES + TWO_QUBIT_GATES + TRIPLE_ANGLE_GATES
 
 QUBIT = r"q\[(\d+)\]"
 CLBIT = r"c\[(\d+)\]"
@@ -42,8 +47,15 @@ _HEADER = re.compile(r"^OPENQASM\s+2\.0$")
 _INCLUDE = re.compile(r'^include\s+"([^"]*)"$')
 _QREG = re.compile(r"^qreg\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[(\d+)\]$")
 _CREG = re.compile(r"^creg\s+([A-Za-z_][A-Za-z0-9_]*)\s*\[(\d+)\]$")
+# The angle text is any run without parentheses, commas, or semicolons; each
+# comma-separated piece is then parsed by the same angle grammar as rx/ry/rz.
 _PARAMETER_GATE = re.compile(
     rf"^(rx|ry|rz)\s*\(\s*([^()]*)\s*\)\s+{QUBIT}$"
+)
+_U3_GATE = re.compile(rf"^u3\s*\(\s*([^(),]*)\s*,\s*([^(),]*)\s*,\s*([^(),]*)\s*\)\s+{QUBIT}$")
+_CU3_GATE = re.compile(
+    rf"^cu3\s*\(\s*([^(),]*)\s*,\s*([^(),]*)\s*,\s*([^(),]*)\s*\)\s+"
+    rf"{QUBIT}\s*,\s*{QUBIT}$"
 )
 _TWO_QUBIT_GATE = re.compile(rf"^(cx|cz)\s+{QUBIT}\s*,\s*{QUBIT}$")
 _SINGLE_QUBIT_GATE = re.compile(rf"^(h|x|y|z|s|t)\s+{QUBIT}$")
@@ -104,25 +116,42 @@ def _evaluate(node: tuple, bindings: dict[str, float]) -> float:
 
 @dataclass(frozen=True)
 class Operation:
-    """One executable statement of the circuit."""
+    """One executable statement of the circuit.
+
+    Parameterised gates carry one `AngleExpression` per angle in declaration
+    order (`rx`/`ry`/`rz` have one, `u3`/`cu3` have three). Once every angle is
+    concrete — constant gates at parse time, parameterised gates after
+    `Circuit.bind` — the values live in `angles` and `expressions` is empty.
+    """
 
     kind: str  # "gate" or "measure"
     name: str  # gate name, or "measure"
     targets: tuple[int, ...]
-    angle: float | None = None
+    angles: tuple[float, ...] = ()
+    expressions: tuple[AngleExpression, ...] = ()
     clbit: int | None = None
     line: int = 0
-    expression: AngleExpression | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": self.name, "targets": list(self.targets)}
-        if self.angle is not None:
-            payload["angle"] = self.angle
-        if self.expression is not None:
-            payload["expression"] = self.expression.text
+        if self.name in ("rx", "ry", "rz"):
+            if self.angles:
+                payload["angle"] = self.angles[0]
+            else:
+                payload["expression"] = self.expressions[0].text
+        elif self.name in TRIPLE_ANGLE_GATES:
+            payload["angles"] = self._angle_payload()
         if self.clbit is not None:
             payload["clbit"] = self.clbit
         return payload
+
+    def _angle_payload(self) -> list[Any]:
+        if self.angles:
+            return list(self.angles)
+        return [
+            expression.evaluate({}) if expression.is_constant else expression.text
+            for expression in self.expressions
+        ]
 
 
 @dataclass(frozen=True)
@@ -169,11 +198,13 @@ class Circuit:
                 operation.kind,
                 operation.name,
                 operation.targets,
-                angle=operation.expression.evaluate(values),
+                angles=tuple(
+                    expression.evaluate(values) for expression in operation.expressions
+                ),
                 clbit=operation.clbit,
                 line=operation.line,
             )
-            if operation.expression is not None
+            if operation.expressions
             else operation
             for operation in self.operations
         )
@@ -440,8 +471,8 @@ def parse_circuit(qasm: str, circuit_id: str) -> Circuit:
         operations.append(operation)
         if operation.kind == "measure" and operation.clbit is not None:
             measurements.append((operation.targets[0], operation.clbit))
-        if operation.expression is not None:
-            for name in operation.expression.names:
+        for expression in operation.expressions:
+            for name in expression.names:
                 if name not in parameters:
                     parameters.append(name)
 
@@ -459,6 +490,26 @@ def parse_circuit(qasm: str, circuit_id: str) -> Circuit:
     )
 
 
+def _angle_gate(
+    name: str,
+    targets: tuple[int, ...],
+    texts: tuple[str, ...],
+    line: int,
+) -> Operation:
+    """Build a gate whose angle slots are constants or parameter expressions."""
+
+    expressions = tuple(parse_angle(text, line) for text in texts)
+    if all(expression.is_constant for expression in expressions):
+        return Operation(
+            "gate",
+            name,
+            targets,
+            angles=tuple(expression.evaluate({}) for expression in expressions),
+            line=line,
+        )
+    return Operation("gate", name, targets, expressions=expressions, line=line)
+
+
 def _parse_operation(text: str, line: int, qubits: int, clbits: int) -> Operation:
     measure = _MEASURE.match(text)
     if measure:
@@ -470,18 +521,32 @@ def _parse_operation(text: str, line: int, qubits: int, clbits: int) -> Operatio
 
     parameter = _PARAMETER_GATE.match(text)
     if parameter:
-        expression = parse_angle(parameter.group(2), line)
         target = _checked_bit(int(parameter.group(3)), qubits, "qubit", line)
-        if expression.is_constant:
-            return Operation(
-                "gate",
-                parameter.group(1),
-                (target,),
-                angle=expression.evaluate({}),
-                line=line,
-            )
-        return Operation(
-            "gate", parameter.group(1), (target,), expression=expression, line=line
+        return _angle_gate(
+            parameter.group(1), (target,), (parameter.group(2),), line
+        )
+
+    cu3 = _CU3_GATE.match(text)
+    if cu3:
+        control = _checked_bit(int(cu3.group(4)), qubits, "qubit", line)
+        target = _checked_bit(int(cu3.group(5)), qubits, "qubit", line)
+        if control == target:
+            raise ParseError(f"line {line}: cu3 requires two distinct qubits")
+        return _angle_gate(
+            "cu3",
+            (control, target),
+            (cu3.group(1), cu3.group(2), cu3.group(3)),
+            line,
+        )
+
+    u3 = _U3_GATE.match(text)
+    if u3:
+        target = _checked_bit(int(u3.group(4)), qubits, "qubit", line)
+        return _angle_gate(
+            "u3",
+            (target,),
+            (u3.group(1), u3.group(2), u3.group(3)),
+            line,
         )
 
     two_qubit = _TWO_QUBIT_GATE.match(text)

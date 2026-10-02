@@ -7,7 +7,7 @@ number of `shots` under a deterministic seed.
 The initial release intentionally supports a compact public contract:
 
 - only a documented OpenQASM 2.0 subset is parsed (`qreg`, `creg`, `h`, `x`,
-  `y`, `z`, `s`, `t`, `rx`, `ry`, `rz`, `cx`, `cz`, `measure`);
+  `y`, `z`, `s`, `t`, `rx`, `ry`, `rz`, `u3`, `cx`, `cz`, `cu3`, `measure`);
 - the statevector index is **little-endian**: `q[0]` is the least significant
   bit, while every probability key and count key printed by the API is
   **big-endian** (most significant qubit first, which is the usual OpenQASM
@@ -89,14 +89,34 @@ any gate. Sizes are limited to 16 qubits and 64 classical bits.
 | --- | --- |
 | `h q[i]`, `x q[i]`, `y q[i]`, `z q[i]`, `s q[i]`, `t q[i]` | one qubit |
 | `rx(angle) q[i]`, `ry(angle) q[i]`, `rz(angle) q[i]` | one qubit |
+| `u3(theta, phi, lambda) q[i]` | one qubit, three angles |
 | `cx q[control], q[target]`, `cz q[control], q[target]` | two distinct qubits |
+| `cu3(theta, phi, lambda) q[control], q[target]` | two distinct qubits, three angles |
 | `measure q[i] -> c[j]` | requires `creg` |
 
 `angle` accepts a plain number, `pi`, `-pi/2`, `2*pi`, and `pi/4` forms.
+`u3` is the OpenQASM arbitrary single-qubit unitary
+
+```
+U(theta, phi, lambda) = [[ cos(theta/2),               -e^{i lambda} sin(theta/2) ],
+                         [ e^{i phi} sin(theta/2),       e^{i(phi+lambda)} cos(theta/2) ]]
+```
+
+(up to an irrelevant global phase), so for example `u3(pi, 0, pi)` is `x` and
+`u3(pi/2, 0, pi)` is `h`. Its circuit document lists the three angles in
+declaration order under `angles`: a constant angle is a number while an angle
+that mentions a parameter is its expression text. `cu3` leaves the target
+unchanged when the control is 0 and applies the same `U3` when it is 1; the
+control and target must differ. Each of the three angles follows the same
+number, `pi`, parameter name, and flat `+ - * /` expression rules as
+`rx`/`ry`/`rz`, and circuit `parameters` are listed in first-occurrence order
+across every gate. After a `u3`/`cu3` gate the depolarizing channel (when
+noise is requested) runs once on each qubit the gate touches.
 Statements are separated by `;` and may span lines; `//` starts a comment.
 Anything else — `swap`, `ccx`, barriers, custom `gate` declarations, unknown
-registers, or an index outside its register — is a `validation_error` whose
-message names the 1-based source line, for example
+registers, an index outside its register, a malformed angle list, or a `cu3`
+whose operands coincide — is a `validation_error` whose message names the
+1-based source line, for example
 `line 3: qubit index 5 is out of range for a register of size 2`.
 
 ### Simulate a circuit

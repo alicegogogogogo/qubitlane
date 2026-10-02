@@ -37,6 +37,32 @@ def initial_state(qubits: int) -> list[complex]:
     return state
 
 
+def _u3_matrix(angles: tuple[float, ...]) -> tuple[tuple[complex, ...], ...]:
+    """The OpenQASM `U(theta, phi, lambda)` single-qubit unitary."""
+
+    theta, phi, lam = angles
+    cosine = math.cos(theta / 2)
+    sine = math.sin(theta / 2)
+    return (
+        (cosine, -cmath.exp(1j * lam) * sine),
+        (cmath.exp(1j * phi) * sine, cmath.exp(1j * (phi + lam)) * cosine),
+    )
+
+
+def _cu3_matrix(angles: tuple[float, ...]) -> tuple[tuple[complex, ...], ...]:
+    """A controlled U3: identity when the control is 0, `U3` when it is 1.
+
+    Indexed by `(control, target)` to match `_apply_matrix`."""
+
+    upper = _u3_matrix(angles)
+    return (
+        (1, 0, 0, 0),
+        (0, 1, 0, 0),
+        (0, 0, upper[0][0], upper[0][1]),
+        (0, 0, upper[1][0], upper[1][1]),
+    )
+
+
 def apply_operation(state: list[complex], qubits: int, operation: Operation) -> None:
     """Apply one gate to `state` in place. `qubits` is the register width."""
 
@@ -44,6 +70,14 @@ def apply_operation(state: list[complex], qubits: int, operation: Operation) -> 
         return
     if operation.name in ("cx", "cz"):
         _apply_controlled(state, operation.targets[0], operation.targets[1], operation.name)
+        return
+    if operation.name == "cu3":
+        if not operation.angles:
+            raise ValidationError(
+                "gate cu3 has an unbound parameter; "
+                "simulate the circuit with parameter bindings"
+            )
+        _apply_matrix(state, operation.targets, _cu3_matrix(operation.angles))
         return
     _apply_single_qubit(state, operation, qubits)
 
@@ -53,13 +87,13 @@ def _apply_single_qubit(state: list[complex], operation: Operation, qubits: int)
     if target >= qubits:  # pragma: no cover - the parser rejects out-of-range qubits
         raise ValidationError(f"qubit {target} is out of range for a {qubits}-qubit circuit")
     mask = 1 << target
-    angle = operation.angle
     name = operation.name
-    if name in ("rx", "ry", "rz") and angle is None:
+    if name in ("rx", "ry", "rz", "u3") and not operation.angles:
         raise ValidationError(
             f"gate {name} has an unbound parameter; "
             "simulate the circuit with parameter bindings"
         )
+    angle = operation.angles[0] if operation.angles else None
     for index in range(len(state)):
         if index & mask:
             continue
@@ -92,6 +126,10 @@ def _apply_single_qubit(state: list[complex], operation: Operation, qubits: int)
         elif name == "rz":
             state[index] = cmath.exp(-1j * angle / 2) * low
             state[index | mask] = cmath.exp(1j * angle / 2) * high
+        elif name == "u3":
+            unitary = _u3_matrix(operation.angles)
+            state[index] = unitary[0][0] * low + unitary[0][1] * high
+            state[index | mask] = unitary[1][0] * low + unitary[1][1] * high
         else:  # pragma: no cover - the parser rejects unknown gates first
             raise ValidationError(f"unsupported gate {name!r}")
 
@@ -138,7 +176,7 @@ def _gate_matrix(operation: Operation) -> tuple[tuple[complex, ...], ...]:
     """The unitary of one gate, matching `_apply_single_qubit`/`_apply_controlled`."""
 
     name = operation.name
-    if name in ("rx", "ry", "rz") and operation.angle is None:
+    if name in ("rx", "ry", "rz", "u3", "cu3") and not operation.angles:
         raise ValidationError(
             f"gate {name} has an unbound parameter; "
             "simulate the circuit with parameter bindings"
@@ -156,18 +194,25 @@ def _gate_matrix(operation: Operation) -> tuple[tuple[complex, ...], ...]:
     if name == "t":
         return ((1, 0), (0, cmath.exp(1j * math.pi / 4)))
     if name == "rx":
-        cosine = math.cos(operation.angle / 2)
-        sine = _rotation(True, operation.angle / 2)
+        angle = operation.angles[0]
+        cosine = math.cos(angle / 2)
+        sine = _rotation(True, angle / 2)
         return ((cosine, sine), (sine, cosine))
     if name == "ry":
-        cosine = math.cos(operation.angle / 2)
-        sine = _rotation(False, operation.angle / 2)
+        angle = operation.angles[0]
+        cosine = math.cos(angle / 2)
+        sine = _rotation(False, angle / 2)
         return ((cosine, -sine), (sine, cosine))
     if name == "rz":
+        angle = operation.angles[0]
         return (
-            (cmath.exp(-1j * operation.angle / 2), 0),
-            (0, cmath.exp(1j * operation.angle / 2)),
+            (cmath.exp(-1j * angle / 2), 0),
+            (0, cmath.exp(1j * angle / 2)),
         )
+    if name == "u3":
+        return _u3_matrix(operation.angles)
+    if name == "cu3":
+        return _cu3_matrix(operation.angles)
     if name == "cx":
         return ((1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 0, 1), (0, 0, 1, 0))
     if name == "cz":

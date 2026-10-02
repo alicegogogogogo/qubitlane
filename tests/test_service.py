@@ -1,3 +1,4 @@
+import cmath
 import math
 import tempfile
 import unittest
@@ -83,9 +84,9 @@ class QasmParsingTests(unittest.TestCase):
         qasm = "OPENQASM 2.0;\nqreg q[1];\nrx(pi/2) q[0];\nry(-2*pi) q[0];\nrz(0.5) q[0];\n"
         circuit = parse_circuit(qasm, "angles")
         rx, ry, rz = circuit.operations
-        self.assertAlmostEqual(math.pi / 2, rx.angle, places=12)
-        self.assertAlmostEqual(-2 * math.pi, ry.angle, places=12)
-        self.assertAlmostEqual(0.5, rz.angle, places=12)
+        self.assertAlmostEqual(math.pi / 2, rx.angles[0], places=12)
+        self.assertAlmostEqual(-2 * math.pi, ry.angles[0], places=12)
+        self.assertAlmostEqual(0.5, rz.angles[0], places=12)
 
     def test_malformed_angles_are_rejected(self):
         with self.assertRaisesRegex(ParseError, "division by zero"):
@@ -489,9 +490,9 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(("theta", "phi"), circuit.parameters)
         bound = circuit.bind({"theta": math.pi, "phi": 0.25})
         rx, ry, rz = bound.operations
-        self.assertAlmostEqual(1.5 * math.pi, rx.angle, places=12)
-        self.assertAlmostEqual(0.5, ry.angle, places=12)
-        self.assertAlmostEqual(-0.25, rz.angle, places=12)
+        self.assertAlmostEqual(1.5 * math.pi, rx.angles[0], places=12)
+        self.assertAlmostEqual(0.5, ry.angles[0], places=12)
+        self.assertAlmostEqual(-0.25, rz.angles[0], places=12)
 
     def test_batch_scenarios_are_indexed_in_order(self):
         self.create_parameter_circuit()
@@ -694,6 +695,321 @@ class BatchTests(unittest.TestCase):
         )
         second = QubitLane(path)
         self.assertEqual(job, second.get_job(job["id"]))
+
+
+class U3ParsingTests(unittest.TestCase):
+    def test_constant_u3_document_has_numeric_angles_in_order(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nu3(0.3, pi/2, -pi) q[0];\n"
+        circuit = parse_circuit(qasm, "u")
+        (operation,) = circuit.operations
+        self.assertEqual("u3", operation.name)
+        self.assertEqual((0,), operation.targets)
+        self.assertEqual((), operation.expressions)
+        self.assertAlmostEqual(0.3, operation.angles[0], places=12)
+        self.assertAlmostEqual(math.pi / 2, operation.angles[1], places=12)
+        self.assertAlmostEqual(-math.pi, operation.angles[2], places=12)
+        self.assertEqual(
+            ["u3"], [entry["name"] for entry in circuit.as_dict()["operations"]]
+        )
+        payload = circuit.as_dict()["operations"][0]
+        self.assertEqual([0], payload["targets"])
+        self.assertAlmostEqual(0.3, payload["angles"][0], places=12)
+        self.assertAlmostEqual(math.pi / 2, payload["angles"][1], places=12)
+        self.assertAlmostEqual(-math.pi, payload["angles"][2], places=12)
+
+    def test_parameterised_u3_keeps_expression_text_and_constants_as_numbers(self):
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nu3(theta, 0, pi) q[0];\n"
+        circuit = parse_circuit(qasm, "u")
+        (operation,) = circuit.operations
+        self.assertEqual((), operation.angles)
+        self.assertEqual(("theta",), circuit.parameters)
+        payload = circuit.as_dict()["operations"][0]
+        self.assertEqual("theta", payload["angles"][0])
+        self.assertEqual(0, payload["angles"][1])
+        self.assertAlmostEqual(math.pi, payload["angles"][2], places=12)
+        bound = circuit.bind({"theta": 0.7})
+        angles = bound.operations[0].angles
+        self.assertAlmostEqual(0.7, angles[0], places=12)
+        self.assertAlmostEqual(0.0, angles[1], places=12)
+        self.assertAlmostEqual(math.pi, angles[2], places=12)
+
+    def test_parameters_are_listed_in_first_occurrence_order(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[2];\n"
+            "u3(a, b, c) q[0];\ncu3(c, a, d) q[0], q[1];\nrx(d) q[1];\n"
+        )
+        circuit = parse_circuit(qasm, "order")
+        self.assertEqual(("a", "b", "c", "d"), circuit.parameters)
+        first = circuit.as_dict()["operations"][0]
+        self.assertEqual(["a", "b", "c"], first["angles"])
+        controlled = circuit.as_dict()["operations"][1]
+        self.assertEqual("cu3", controlled["name"])
+        self.assertEqual([0, 1], controlled["targets"])
+        self.assertEqual(["c", "a", "d"], controlled["angles"])
+
+    def test_cu3_constant_operation(self):
+        qasm = "OPENQASM 2.0;\nqreg q[2];\ncu3(1, 2, 3) q[1], q[0];\n"
+        circuit = parse_circuit(qasm, "c")
+        operation = circuit.operations[0]
+        self.assertEqual("cu3", operation.name)
+        self.assertEqual((1, 0), operation.targets)
+        self.assertEqual((1.0, 2.0, 3.0), operation.angles)
+
+    def test_u3_and_cu3_parse_errors_name_the_line(self):
+        cases = {
+            "u3(0, 0) q[0];": "malformed u3",
+            "u3(0, 0, 0, 0) q[0];": "malformed u3",
+            "u3(0, 0, 0 q[0];": "malformed u3",
+            "cu3(0, 0, 0) q[0] q[1];": "malformed cu3",
+            "u3(pi/0, 0, 0) q[0];": "division by zero",
+            "u3(theta+, 0, 0) q[0];": "numeric expression",
+        }
+        for statement, fragment in cases.items():
+            qasm = f"OPENQASM 2.0;\nqreg q[2];\n{statement}\n"
+            with self.assertRaisesRegex(ParseError, rf"line 3:.*{fragment}"):
+                parse_circuit(qasm, "bad")
+
+    def test_u3_cu3_register_and_operand_errors(self):
+        with self.assertRaisesRegex(ParseError, r"line 3: qubit index 2 is out of range"):
+            parse_circuit("OPENQASM 2.0;\nqreg q[2];\nu3(0,0,0) q[2];\n", "bad")
+        with self.assertRaisesRegex(ParseError, r"line 3: qubit index 3 is out of range"):
+            parse_circuit("OPENQASM 2.0;\nqreg q[2];\ncu3(0,0,0) q[3], q[0];\n", "bad")
+        with self.assertRaisesRegex(ParseError, r"line 3: cu3 requires two distinct qubits"):
+            parse_circuit("OPENQASM 2.0;\nqreg q[2];\ncu3(0,0,0) q[1], q[1];\n", "bad")
+
+
+class U3SimulationTests(unittest.TestCase):
+    @staticmethod
+    def expected_single(theta, phi, lam):
+        cosine = math.cos(theta / 2)
+        sine = math.sin(theta / 2)
+        return (
+            cosine,
+            -cmath.exp(1j * lam) * sine,
+            cmath.exp(1j * phi) * sine,
+            cmath.exp(1j * (phi + lam)) * cosine,
+        )
+
+    def test_u3_matches_the_openqasm_u_matrix(self):
+        theta, phi, lam = 1.1, 0.7, 2.3
+        qasm = f"OPENQASM 2.0;\nqreg q[1];\nu3({theta}, {phi}, {lam}) q[0];\n"
+        state = simulate(parse_circuit(qasm, "u"))
+        zero, one = self.expected_single(theta, phi, lam)[0], self.expected_single(
+            theta, phi, lam
+        )[2]
+        self.assertAlmostEqual(zero, state[0], places=12)
+        self.assertAlmostEqual(one, state[1], places=12)
+        self.assertAlmostEqual(1.0, norm_squared(state), places=12)
+
+    def test_u3_reproduces_standard_gates_exactly(self):
+        cases = {
+            (math.pi, 0, math.pi): "x",
+            (math.pi / 2, 0, math.pi): "h",
+        }
+        for angles, equivalent in cases.items():
+            qasm = (
+                "OPENQASM 2.0;\nqreg q[1];\n"
+                f"u3({angles[0]}, {angles[1]}, {angles[2]}) q[0];\n"
+            )
+            reference_qasm = f"OPENQASM 2.0;\nqreg q[1];\n{equivalent} q[0];\n"
+            self.assertAlmostEqual(
+                simulate(parse_circuit(reference_qasm, "ref"))[0],
+                simulate(parse_circuit(qasm, "u"))[0],
+                places=12,
+            )
+            self.assertAlmostEqual(
+                simulate(parse_circuit(reference_qasm, "ref"))[1],
+                simulate(parse_circuit(qasm, "u"))[1],
+                places=12,
+            )
+
+    def test_u3_equals_ry_and_rz_diagonal(self):
+        # U(theta, 0, 0) is exactly Ry(theta); U(0, 0, pi) is exactly Z
+        state = simulate(
+            parse_circuit("OPENQASM 2.0;\nqreg q[1];\nu3(0.9, 0, 0) q[0];\n", "u")
+        )
+        reference = simulate(
+            parse_circuit("OPENQASM 2.0;\nqreg q[1];\nry(0.9) q[0];\n", "r")
+        )
+        self.assertAlmostEqual(reference[0], state[0], places=12)
+        self.assertAlmostEqual(reference[1], state[1], places=12)
+        z_like = simulate(
+            parse_circuit("OPENQASM 2.0;\nqreg q[1];\nx q[0];\nu3(0, 0, pi) q[0];\n", "z")
+        )
+        self.assertAlmostEqual(0.0, abs(z_like[0]), places=12)
+        self.assertAlmostEqual(1.0, abs(z_like[1]), places=12)
+
+    def test_cu3_leaves_the_zero_control_subspace_unchanged(self):
+        qasm = "OPENQASM 2.0;\nqreg q[2];\ncu3(1.1, 0.7, 2.3) q[1], q[0];\n"
+        state = simulate(parse_circuit(qasm, "c"))
+        self.assertEqual(1 + 0j, state[0])
+        self.assertTrue(all(amplitude == 0 for amplitude in state[1:]))
+
+    def test_cu3_applies_u3_under_full_control(self):
+        angles = (1.1, 0.7, 2.3)
+        body = f"cu3({angles[0]}, {angles[1]}, {angles[2]}) q[1], q[0]"
+        controlled = simulate(
+            parse_circuit(f"OPENQASM 2.0;\nqreg q[2];\nx q[1];\n{body};\n", "c")
+        )
+        plain = simulate(
+            parse_circuit(
+                f"OPENQASM 2.0;\nqreg q[2];\nx q[1];\nu3({angles[0]}, {angles[1]}, {angles[2]}) q[0];\n",
+                "u",
+            )
+        )
+        for index in range(4):
+            self.assertAlmostEqual(plain[index], controlled[index], places=12)
+
+    def test_cu3_superposition_probabilities(self):
+        # h on control q[0], target q[1]: |00>/sqrt2 + (cos|01> + e^{i phi}sin|11>)/sqrt2
+        theta, phi = 0.8, 1.2
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[2];\n"
+            f"h q[0];\ncu3({theta}, {phi}, 0.4) q[0], q[1];\n"
+        )
+        state = simulate(parse_circuit(qasm, "bellish"))
+        cosine_sq = math.cos(theta / 2) ** 2 / 2
+        sine_sq = math.sin(theta / 2) ** 2 / 2
+        self.assertAlmostEqual(0.5, abs(state[0]) ** 2, places=12)
+        self.assertAlmostEqual(cosine_sq, abs(state[1]) ** 2, places=12)
+        self.assertAlmostEqual(0.0, abs(state[2]) ** 2, places=12)
+        self.assertAlmostEqual(sine_sq, abs(state[3]) ** 2, places=12)
+        self.assertAlmostEqual(1.0, norm_squared(state), places=12)
+
+    def test_gate_sequence_with_u3_stays_normalised(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[3];\n"
+            "h q[0];\nu3(0.6, 1.2, 2.4) q[1];\ncu3(0.3, 0.9, 1.5) q[0], q[2];\n"
+            "cx q[2], q[1];\nu3(1.7, 0.2, 0.4) q[0];\n"
+        )
+        self.assertLess(abs(norm_squared(simulate(parse_circuit(qasm, "mix"))) - 1.0), TOLERANCE)
+
+    def test_unbound_u3_and_cu3_are_validation_errors(self):
+        from qubitlane.errors import ValidationError
+
+        service = QubitLane(":memory:")
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nu3(theta, phi, lam) q[0];\n"
+        service.create_circuit({"id": "u", "qasm": qasm}, "k1")
+        with self.assertRaisesRegex(ValidationError, "unbound parameter"):
+            service.simulate("u", {"shots": 4}, "k2")
+        with self.assertRaisesRegex(ValidationError, "unbound parameter"):
+            service.get_statevector("u")
+        controlled = "OPENQASM 2.0;\nqreg q[2];\ncu3(theta, 0, 0) q[0], q[1];\n"
+        service.create_circuit({"id": "c", "qasm": controlled}, "k3")
+        with self.assertRaisesRegex(ValidationError, "unbound parameter"):
+            service.simulate("c", {"shots": 4}, "k4")
+
+
+class U3ServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = QubitLane(str(Path(self.directory.name) / "qubitlane.db"))
+        self.counter = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def key(self, prefix: str = "k") -> str:
+        self.counter += 1
+        return f"{prefix}-{self.counter}"
+
+    def test_u3_counts_and_probabilities_through_the_service(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[1];\ncreg c[1];\n"
+            "u3(pi/2, 0, pi) q[0];\nmeasure q[0] -> c[0];\n"
+        )
+        self.service.create_circuit({"id": "hadamard", "qasm": qasm}, self.key())
+        job = self.service.simulate("hadamard", {"shots": 100, "seed": 7}, self.key())
+        self.assertAlmostEqual(0.5, job["probabilities"]["0"], places=12)
+        self.assertAlmostEqual(0.5, job["probabilities"]["1"], places=12)
+        self.assertEqual(100, sum(job["counts"].values()))
+
+    def test_cu3_noise_touches_both_qubits(self):
+        # cu3(0,0,0) is the identity, yet the depolarizing channel still runs
+        # once on each of the control and the target.
+        qasm = "OPENQASM 2.0;\nqreg q[2];\ncu3(0, 0, 0) q[0], q[1];\n"
+        self.service.create_circuit({"id": "id2", "qasm": qasm}, self.key())
+        job = self.service.simulate(
+            "id2",
+            {"shots": 10, "seed": 1, "noise": {"type": "depolarizing", "probability": 0.25}},
+            self.key(),
+        )
+        keep = 5 / 6
+        self.assertAlmostEqual(keep**2, job["probabilities"]["00"], places=12)
+        self.assertAlmostEqual(keep / 6, job["probabilities"]["01"], places=12)
+        self.assertAlmostEqual(keep / 6, job["probabilities"]["10"], places=12)
+        self.assertAlmostEqual(1 / 36, job["probabilities"]["11"], places=12)
+
+    def test_noisy_u3_matches_noisy_equivalent_x(self):
+        u3_qasm = "OPENQASM 2.0;\nqreg q[1];\nu3(pi, 0, pi) q[0];\n"
+        x_qasm = "OPENQASM 2.0;\nqreg q[1];\nx q[0];\n"
+        self.service.create_circuit({"id": "u", "qasm": u3_qasm}, self.key())
+        self.service.create_circuit({"id": "x", "qasm": x_qasm}, self.key())
+        noise = {"type": "depolarizing", "probability": 0.3}
+        u3_job = self.service.simulate("u", {"shots": 10, "seed": 1, "noise": noise}, self.key())
+        x_job = self.service.simulate("x", {"shots": 10, "seed": 1, "noise": noise}, self.key())
+        self.assertEqual(x_job["probabilities"], u3_job["probabilities"])
+
+    def test_u3_parameter_sweep(self):
+        qasm = (
+            "OPENQASM 2.0;\nqreg q[1];\ncreg c[1];\n"
+            "u3(theta, 0, pi) q[0];\nmeasure q[0] -> c[0];\n"
+        )
+        self.service.create_circuit({"id": "sweep", "qasm": qasm}, self.key())
+        job = self.service.simulate(
+            "sweep",
+            {"shots": 50, "seed": 2, "parameters": {"theta": [0.0, math.pi]}},
+            self.key(),
+        )
+        self.assertEqual(2, job["scenario_count"])
+        self.assertEqual({"0": 50}, job["scenarios"][0]["counts"])
+        self.assertEqual({"1": 50}, job["scenarios"][1]["counts"])
+
+    def test_u3_single_scenario_matches_constant_circuit(self):
+        parameterised = (
+            "OPENQASM 2.0;\nqreg q[1];\nu3(theta, phi, lam) q[0];\n"
+        )
+        constant = "OPENQASM 2.0;\nqreg q[1];\nu3(0.7, 0.2, 1.1) q[0];\n"
+        self.service.create_circuit({"id": "p", "qasm": parameterised}, self.key())
+        self.service.create_circuit({"id": "k", "qasm": constant}, self.key())
+        plain = self.service.simulate("k", {"shots": 128, "seed": 11}, self.key())
+        batch = self.service.simulate(
+            "p",
+            {
+                "shots": 128,
+                "seed": 11,
+                "parameters": {"theta": [0.7], "phi": [0.2], "lam": [1.1]},
+            },
+            self.key(),
+        )
+        self.assertEqual(plain["counts"], batch["scenarios"][0]["counts"])
+
+    def test_u3_batch_missing_parameter_is_param_undefined(self):
+        from qubitlane.errors import ParamUndefinedError
+
+        qasm = "OPENQASM 2.0;\nqreg q[1];\nu3(theta, phi, lam) q[0];\n"
+        self.service.create_circuit({"id": "u", "qasm": qasm}, self.key())
+        with self.assertRaises(ParamUndefinedError):
+            # lam is not bound
+            self.service.simulate(
+                "u",
+                {"parameters": {"theta": [0.1], "phi": [0.2]}},
+                self.key(),
+            )
+        with self.assertRaises(ParamUndefinedError):
+            # extra is not a parameter of the circuit
+            self.service.simulate(
+                "u",
+                {
+                    "parameters": {
+                        "theta": [0.1],
+                        "phi": [0.2],
+                        "lam": [0.3],
+                        "extra": [0.4],
+                    }
+                },
+                self.key(),
+            )
 
 
 if __name__ == "__main__":
