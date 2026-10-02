@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from typing import Any, Callable
 
-from .errors import ConflictError, NotFoundError, ValidationError
-from .model import CircuitRequest, SimulationRequest
-from .qasm import Circuit, identifier, parse_circuit
+from .errors import (
+    BatchLimitExceededError,
+    ConflictError,
+    NotFoundError,
+    ParameterUndefinedError,
+    ValidationError,
+)
+from .model import MAX_BATCH_TOTAL_SHOTS, CircuitRequest, NoiseSpec, SimulationRequest
+from .qasm import Circuit, bind_parameters, identifier, parameter_names, parse_circuit
 from .simulator import (
     MAX_NOISE_QUBITS,
     Sampler,
     assert_normalized,
     assert_normalized_weights,
     density_probabilities,
-    distribution,
     nonzero_amplitudes,
     probabilities,
     simulate,
@@ -84,6 +90,7 @@ class QubitLane:
             raise ValidationError(
                 f"noise simulation supports at most {MAX_NOISE_QUBITS} qubits"
             )
+        self._check_parameters(document, request)
 
         job_id = self._job_id(circuit_id, request)
 
@@ -93,7 +100,10 @@ class QubitLane:
             ).fetchone()
             if existing:
                 return self.store.decode(existing["document"])
-            job = self._execute(circuit_id, job_id, request)
+            if request.parameters is not None:
+                job = self._execute_batch(circuit_id, job_id, request)
+            else:
+                job = self._execute(circuit_id, job_id, request)
             self.store.connection.execute(
                 "INSERT INTO jobs(id, circuit_id, document) VALUES (?, ?, ?)",
                 (job_id, circuit_id, self.store.encode(job)),
@@ -101,6 +111,47 @@ class QubitLane:
             return job
 
         return self._idempotent(key, f"simulate:{job_id}", run)
+
+    @staticmethod
+    def _check_parameters(document: dict[str, Any], request: SimulationRequest) -> None:
+        """Validate the request's bindings against the circuit's parameters.
+
+        Every binding name must resolve to a parameter expression in the
+        circuit, every circuit parameter must be bound, and the total draw
+        count `scenarios * shots` must stay within the service limit. Any
+        failure raises before a job is created.
+        """
+
+        defined = tuple(
+            dict.fromkeys(
+                operation["parameter"]
+                for operation in document["operations"]
+                if "parameter" in operation
+            )
+        )
+        bindings = request.parameters
+        if bindings is None:
+            if defined:
+                raise ParameterUndefinedError(
+                    f"circuit parameter {defined[0]!r} has no binding in the request"
+                )
+            return
+        for name in bindings.names:
+            if name not in defined:
+                raise ParameterUndefinedError(
+                    f"parameter {name!r} is not used by the circuit"
+                )
+        for name in defined:
+            if name not in bindings.names:
+                raise ParameterUndefinedError(
+                    f"circuit parameter {name!r} has no binding in the request"
+                )
+        total = bindings.scenarios * request.shots
+        if total > MAX_BATCH_TOTAL_SHOTS:
+            raise BatchLimitExceededError(
+                f"batch of {bindings.scenarios} scenarios at {request.shots} shots each "
+                f"exceeds the limit of {MAX_BATCH_TOTAL_SHOTS} total shots"
+            )
 
     def get_statevector(self, circuit_id: str) -> dict[str, Any]:
         identifier(circuit_id, "circuit id")
@@ -128,16 +179,8 @@ class QubitLane:
 
     def _execute(self, circuit_id: str, job_id: str, request: SimulationRequest) -> dict[str, Any]:
         circuit = self._load(circuit_id)
-        if request.noise is not None:
-            rho = simulate_density(circuit, request.noise.probability)
-            weights = density_probabilities(rho, circuit.qubits)
-            defect = assert_normalized_weights(weights)
-            probabilities_document = weight_distribution(circuit, weights)
-        else:
-            state = simulate(circuit)
-            defect = assert_normalized(state)
-            weights = probabilities(state)
-            probabilities_document = distribution(circuit, state)
+        weights, defect = self._weights(circuit, request.noise)
+        probabilities_document = weight_distribution(circuit, weights)
         sampler = Sampler(request.seed)
         raw_counts = sampler.sample(weights, request.shots, circuit.qubits)
         counts = {self._measured_key(circuit, label): value for label, value in raw_counts.items()}
@@ -160,6 +203,68 @@ class QubitLane:
             job["noise"] = request.noise.as_dict()
         return job
 
+    def _execute_batch(
+        self, circuit_id: str, job_id: str, request: SimulationRequest
+    ) -> dict[str, Any]:
+        """Run one scenario per parameter position, in scenario order.
+
+        Each scenario binds its values, executes the circuit, and draws
+        `shots` samples from a sampler seeded by `(seed, index)`, so the
+        stored result is identical no matter how scenarios are scheduled.
+        """
+
+        circuit = self._load(circuit_id)
+        bindings = request.parameters
+        scenarios: list[dict[str, Any]] = []
+        for index in range(bindings.scenarios):
+            values = {
+                name: bindings.values[position][index]
+                for position, name in enumerate(bindings.names)
+            }
+            bound = bind_parameters(circuit, values)
+            weights, _ = self._weights(bound, request.noise)
+            sampler = Sampler(request.seed + index)
+            raw_counts = sampler.sample(weights, request.shots, bound.qubits)
+            counts = {
+                self._measured_key(bound, label): value
+                for label, value in raw_counts.items()
+            }
+            scenarios.append(
+                {
+                    "index": index,
+                    "values": values,
+                    "counts": {key: counts[key] for key in sorted(counts)},
+                }
+            )
+        job = {
+            "id": job_id,
+            "circuit_id": circuit.id,
+            "state": "completed",
+            "shots": request.shots,
+            "seed": request.seed,
+            "qubits": circuit.qubits,
+            "bit_order": "little_endian",
+            "scenario_count": bindings.scenarios,
+            "parameters": list(bindings.names),
+            "scenarios": scenarios,
+            "measured_bits": self._measured_bit_count(circuit),
+            "created_at": self.store.now(),
+        }
+        if request.noise is not None:
+            job["noise"] = request.noise.as_dict()
+        return job
+
+    @staticmethod
+    def _weights(circuit: Circuit, noise: NoiseSpec | None) -> tuple[list[float], float]:
+        """The final basis-state weights and the normalisation defect."""
+
+        if noise is not None:
+            rho = simulate_density(circuit, noise.probability)
+            weights = density_probabilities(rho, circuit.qubits)
+            return weights, assert_normalized_weights(weights)
+        state = simulate(circuit)
+        return probabilities(state), assert_normalized(state)
+
     @staticmethod
     def _measured_bit_count(circuit: Circuit) -> int:
         if not circuit.measurements:
@@ -171,6 +276,16 @@ class QubitLane:
         raw = f"{circuit_id}|{request.shots}|{request.seed}"
         if request.noise is not None:
             raw += f"|{request.noise.type}|{request.noise.probability!r}"
+        if request.parameters is not None:
+            canonical = json.dumps(
+                {
+                    name: list(request.parameters.values[position])
+                    for position, name in enumerate(request.parameters.names)
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            raw += f"|parameters:{canonical}"
         return f"j-{hashlib.sha256(raw.encode('utf-8')).hexdigest()[:16]}"
 
     @staticmethod

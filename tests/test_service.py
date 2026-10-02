@@ -429,5 +429,280 @@ class NoiseTests(unittest.TestCase):
             self.service.simulate("missing", {"noise": self.noise()}, self.key())
 
 
+class BatchTests(unittest.TestCase):
+    PARAMETERIZED = (
+        "OPENQASM 2.0;\n"
+        'include "qelib1.inc";\n'
+        "qreg q[1];\n"
+        "creg c[1];\n"
+        "rx(theta) q[0];\n"
+        "measure q[0] -> c[0];\n"
+    )
+
+    TWO_PARAMETER = (
+        "OPENQASM 2.0;\n"
+        "qreg q[1];\n"
+        "rx(theta) q[0];\n"
+        "rz(phi) q[0];\n"
+    )
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.service = QubitLane(str(Path(self.directory.name) / "qubitlane.db"))
+        self.counter = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def key(self, prefix: str = "k") -> str:
+        self.counter += 1
+        return f"{prefix}-{self.counter}"
+
+    def create(self, qasm: str, circuit_id: str) -> None:
+        self.service.create_circuit(circuit_document(qasm, circuit_id), self.key())
+
+    def error_code(self, callback, *arguments) -> str:
+        with self.assertRaises(ValidationError) as context:
+            callback(*arguments)
+        return context.exception.code
+
+    def test_parameterized_gate_parses_to_a_parameter_operation(self):
+        circuit = parse_circuit(self.PARAMETERIZED, "p")
+        rx = circuit.operations[0]
+        self.assertEqual("theta", rx.parameter)
+        self.assertIsNone(rx.angle)
+        document = self.service.create_circuit(
+            circuit_document(self.PARAMETERIZED, "p"), self.key()
+        )
+        self.assertEqual("theta", document["operations"][0]["parameter"])
+
+    def test_batch_returns_scenarios_in_index_order(self):
+        self.create(self.PARAMETERIZED, "p")
+        job = self.service.simulate(
+            "p",
+            {"shots": 100, "seed": 3, "parameters": {"theta": [0.0, math.pi]}},
+            self.key(),
+        )
+        self.assertEqual("completed", job["state"])
+        self.assertEqual(2, job["scenario_count"])
+        self.assertEqual(["theta"], job["parameters"])
+        self.assertEqual([0, 1], [scenario["index"] for scenario in job["scenarios"]])
+        first, second = job["scenarios"]
+        self.assertEqual({"theta": 0.0}, first["values"])
+        self.assertEqual({"theta": math.pi}, second["values"])
+        # theta = 0 keeps |0>; theta = pi flips to |1>
+        self.assertEqual({"0": 100}, first["counts"])
+        self.assertEqual({"1": 100}, second["counts"])
+        # shots are per scenario, not shared across the batch
+        for scenario in job["scenarios"]:
+            self.assertEqual(100, sum(scenario["counts"].values()))
+
+    def test_multiple_parameters_bind_positionally(self):
+        self.create(self.TWO_PARAMETER, "p2")
+        job = self.service.simulate(
+            "p2",
+            {
+                "shots": 50,
+                "seed": 1,
+                "parameters": {"theta": [0.0, math.pi], "phi": [0.0, 0.0]},
+            },
+            self.key(),
+        )
+        self.assertEqual(["theta", "phi"], job["parameters"])
+        self.assertEqual(
+            [{"theta": 0.0, "phi": 0.0}, {"theta": math.pi, "phi": 0.0}],
+            [scenario["values"] for scenario in job["scenarios"]],
+        )
+        self.assertEqual({"0": 50}, job["scenarios"][0]["counts"])
+        self.assertEqual({"1": 50}, job["scenarios"][1]["counts"])
+
+    def test_batch_is_deterministic_per_seed_and_stable_across_seeds(self):
+        self.create(self.PARAMETERIZED, "p")
+        body = {"shots": 400, "seed": 7, "parameters": {"theta": [0.3, 1.1, 2.4]}}
+        first = self.service.simulate("p", body, self.key())
+        repeat = self.service.simulate("p", dict(body), self.key())
+        self.assertEqual(first, repeat)
+        self.assertEqual(first, self.service.get_job(first["id"]))
+        other = self.service.simulate("p", {**body, "seed": 8}, self.key())
+        self.assertNotEqual(first["id"], other["id"])
+        self.assertNotEqual(
+            [s["counts"] for s in first["scenarios"]],
+            [s["counts"] for s in other["scenarios"]],
+        )
+        # a different seed never changes the scenario order
+        self.assertEqual(
+            [s["values"] for s in first["scenarios"]],
+            [s["values"] for s in other["scenarios"]],
+        )
+
+    def test_batch_job_id_depends_on_the_bindings(self):
+        self.create(self.PARAMETERIZED, "p")
+        base = {"shots": 10, "seed": 1}
+        first = self.service.simulate(
+            "p", {**base, "parameters": {"theta": [0.1]}}, self.key()
+        )
+        same = self.service.simulate(
+            "p", {**base, "parameters": {"theta": [0.1]}}, self.key()
+        )
+        changed = self.service.simulate(
+            "p", {**base, "parameters": {"theta": [0.2]}}, self.key()
+        )
+        other_shots = self.service.simulate(
+            "p", {"shots": 11, "seed": 1, "parameters": {"theta": [0.1]}}, self.key()
+        )
+        self.assertEqual(first["id"], same["id"])
+        self.assertNotEqual(first["id"], changed["id"])
+        self.assertNotEqual(first["id"], other_shots["id"])
+
+    def test_batch_result_is_reread_without_reexecuting(self):
+        self.create(self.PARAMETERIZED, "p")
+        body = {"shots": 64, "seed": 5, "parameters": {"theta": [0.2, 0.9]}}
+        job = self.service.simulate("p", body, self.key())
+        for _ in range(3):
+            self.assertEqual(job, self.service.get_job(job["id"]))
+        replayed = self.service.simulate("p", body, self.key())
+        self.assertEqual(job, replayed)
+
+    def test_unbound_circuit_parameter_is_param_undefined(self):
+        self.create(self.PARAMETERIZED, "p")
+        code = self.error_code(self.service.simulate, "p", {"shots": 10}, self.key())
+        self.assertEqual("PARAM_UNDEFINED", code)
+
+    def test_unknown_binding_name_is_param_undefined(self):
+        self.create(self.PARAMETERIZED, "p")
+        code = self.error_code(
+            self.service.simulate,
+            "p",
+            {"shots": 10, "parameters": {"theta": [0.1], "gamma": [0.2]}},
+            self.key(),
+        )
+        self.assertEqual("PARAM_UNDEFINED", code)
+
+    def test_binding_on_a_plain_circuit_is_param_undefined(self):
+        self.create(BELL, "bell")
+        code = self.error_code(
+            self.service.simulate,
+            "bell",
+            {"shots": 10, "parameters": {"theta": [0.1]}},
+            self.key(),
+        )
+        self.assertEqual("PARAM_UNDEFINED", code)
+
+    def test_partially_bound_circuit_is_param_undefined(self):
+        self.create(self.TWO_PARAMETER, "p2")
+        code = self.error_code(
+            self.service.simulate,
+            "p2",
+            {"shots": 10, "parameters": {"theta": [0.1]}},
+            self.key(),
+        )
+        self.assertEqual("PARAM_UNDEFINED", code)
+
+    def test_array_length_mismatch(self):
+        self.create(self.TWO_PARAMETER, "p2")
+        code = self.error_code(
+            self.service.simulate,
+            "p2",
+            {"shots": 10, "parameters": {"theta": [0.1, 0.2], "phi": [0.1]}},
+            self.key(),
+        )
+        self.assertEqual("PARAM_ARRAY_LENGTH_MISMATCH", code)
+
+    def test_empty_array_is_rejected(self):
+        self.create(self.PARAMETERIZED, "p")
+        code = self.error_code(
+            self.service.simulate, "p", {"shots": 10, "parameters": {"theta": []}}, self.key()
+        )
+        self.assertEqual("PARAM_ARRAY_EMPTY", code)
+
+    def test_non_finite_and_non_numeric_values_are_rejected(self):
+        self.create(self.PARAMETERIZED, "p")
+        for value in (float("nan"), float("inf"), -float("inf"), "0.5", True):
+            code = self.error_code(
+                self.service.simulate,
+                "p",
+                {"shots": 10, "parameters": {"theta": [value]}},
+                self.key(),
+            )
+            self.assertEqual("PARAM_VALUE_INVALID", code)
+
+    def test_invalid_shots_in_a_batch_is_shots_invalid(self):
+        self.create(self.PARAMETERIZED, "p")
+        for shots in (0, -3, 1.5, True, "10"):
+            code = self.error_code(
+                self.service.simulate,
+                "p",
+                {"shots": shots, "parameters": {"theta": [0.1]}},
+                self.key(),
+            )
+            self.assertEqual("SHOTS_INVALID", code)
+
+    def test_batch_limit_is_enforced_without_creating_a_job(self):
+        self.create(self.PARAMETERIZED, "p")
+        code = self.error_code(
+            self.service.simulate,
+            "p",
+            {"shots": 501, "parameters": {"theta": [0.1] * 200}},
+            self.key(),
+        )
+        self.assertEqual("BATCH_LIMIT_EXCEEDED", code)
+        # the boundary itself is accepted: 200 * 500 == 100_000
+        job = self.service.simulate(
+            "p", {"shots": 500, "parameters": {"theta": [0.1] * 200}}, self.key()
+        )
+        self.assertEqual(200, job["scenario_count"])
+
+    def test_failed_batch_requests_create_no_job(self):
+        self.create(self.PARAMETERIZED, "p")
+        before = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM jobs"
+        ).fetchone()["n"]
+        for body in (
+            {"shots": 10, "parameters": {"gamma": [0.1]}},
+            {"shots": 10, "parameters": {"theta": []}},
+            {"shots": 10, "parameters": {"theta": [float("nan")]}},
+            {"shots": 0, "parameters": {"theta": [0.1]}},
+            {"shots": 100_001, "parameters": {"theta": [0.1]}},
+        ):
+            with self.assertRaises(ValidationError):
+                self.service.simulate("p", body, self.key())
+        after = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM jobs"
+        ).fetchone()["n"]
+        self.assertEqual(before, after)
+
+    def test_plain_requests_keep_their_existing_error_codes(self):
+        self.create(BELL, "bell")
+        code = self.error_code(self.service.simulate, "bell", {"shots": 0}, self.key())
+        self.assertEqual("validation_error", code)
+
+    def test_batch_supports_noise(self):
+        self.create(self.PARAMETERIZED, "p")
+        job = self.service.simulate(
+            "p",
+            {
+                "shots": 20,
+                "seed": 2,
+                "noise": {"type": "depolarizing", "probability": 0.1},
+                "parameters": {"theta": [0.0, math.pi]},
+            },
+            self.key(),
+        )
+        self.assertEqual({"type": "depolarizing", "probability": 0.1}, job["noise"])
+        self.assertEqual(2, job["scenario_count"])
+        for scenario in job["scenarios"]:
+            self.assertEqual(20, sum(scenario["counts"].values()))
+
+    def test_batch_survives_a_new_service_instance(self):
+        path = str(Path(self.directory.name) / "shared.db")
+        first = QubitLane(path)
+        first.create_circuit(circuit_document(self.PARAMETERIZED, "p"), self.key())
+        job = first.simulate(
+            "p", {"shots": 32, "seed": 4, "parameters": {"theta": [0.4, 0.8]}}, self.key()
+        )
+        second = QubitLane(path)
+        self.assertEqual(job, second.get_job(job["id"]))
+
+
 if __name__ == "__main__":
     unittest.main()

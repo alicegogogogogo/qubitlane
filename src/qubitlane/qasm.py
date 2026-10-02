@@ -11,13 +11,17 @@ that names the 1-based source line.
     rx|ry|rz(theta) q[i];
     cx|cz q[control], q[target];
     measure q[i] -> c[j];
+
+A rotation angle may also be a bare parameter name such as `rx(theta) q[0]`.
+The name is stored on the operation and substituted with a concrete value by
+`bind_parameters` before the circuit is executed.
 """
 
 from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .errors import ParseError, ValidationError
@@ -48,6 +52,7 @@ _NUMBER = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
 _PI_MULTIPLE = re.compile(r"^([+-]?(?:\d+\.?\d*|\.\d+))\s*\*\s*pi$")
 _PI_DIVISOR = re.compile(r"^pi\s*/\s*([+-]?(?:\d+\.?\d*|\.\d+))$")
 _PI = re.compile(r"^[+-]?pi$")
+_PARAMETER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 @dataclass(frozen=True)
@@ -60,11 +65,14 @@ class Operation:
     angle: float | None = None
     clbit: int | None = None
     line: int = 0
+    parameter: str | None = None  # symbolic angle, bound before execution
 
     def as_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"name": self.name, "targets": list(self.targets)}
         if self.angle is not None:
             payload["angle"] = self.angle
+        if self.parameter is not None:
+            payload["parameter"] = self.parameter
         if self.clbit is not None:
             payload["clbit"] = self.clbit
         return payload
@@ -241,8 +249,11 @@ def _parse_operation(text: str, line: int, qubits: int, clbits: int) -> Operatio
 
     parameter = _PARAMETER_GATE.match(text)
     if parameter:
-        angle = parse_number(parameter.group(2), line)
         target = _checked_bit(int(parameter.group(3)), qubits, "qubit", line)
+        name = _parameter_name(parameter.group(2))
+        if name is not None:
+            return Operation("gate", parameter.group(1), (target,), parameter=name, line=line)
+        angle = parse_number(parameter.group(2), line)
         return Operation("gate", parameter.group(1), (target,), angle=angle, line=line)
 
     two_qubit = _TWO_QUBIT_GATE.match(text)
@@ -264,6 +275,54 @@ def _parse_operation(text: str, line: int, qubits: int, clbits: int) -> Operatio
     if name in GATES:
         raise ParseError(f"line {line}: malformed {name} statement {text!r}")
     raise ParseError(f"line {line}: unsupported statement or gate {text!r}")
+
+
+def _parameter_name(text: str) -> str | None:
+    """The bare parameter name in an angle expression, or `None` for numbers."""
+
+    candidate = text.strip()
+    if candidate == "pi":
+        return None
+    if _PARAMETER_NAME.match(candidate):
+        return candidate
+    return None
+
+
+def parameter_names(circuit: Circuit) -> tuple[str, ...]:
+    """The circuit's parameter names, in order of first appearance."""
+
+    return tuple(
+        dict.fromkeys(
+            operation.parameter
+            for operation in circuit.operations
+            if operation.parameter is not None
+        )
+    )
+
+
+def bind_parameters(circuit: Circuit, values: dict[str, float]) -> Circuit:
+    """Return a copy of `circuit` with every parameter replaced by its value."""
+
+    operations: list[Operation] = []
+    for operation in circuit.operations:
+        if operation.parameter is None:
+            operations.append(operation)
+            continue
+        if operation.parameter not in values:
+            raise ValidationError(
+                f"circuit parameter {operation.parameter!r} has no binding"
+            )
+        operations.append(
+            Operation(
+                operation.kind,
+                operation.name,
+                operation.targets,
+                angle=values[operation.parameter],
+                clbit=operation.clbit,
+                line=operation.line,
+            )
+        )
+    return replace(circuit, operations=tuple(operations))
 
 
 def _checked_bit(value: int, size: int, label: str, line: int) -> int:
