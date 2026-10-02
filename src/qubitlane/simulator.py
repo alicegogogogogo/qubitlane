@@ -1,0 +1,230 @@
+"""Statevector simulation for the supported OpenQASM 2.0 subset.
+
+Bit order convention: the statevector index is little-endian. Qubit `q[0]` is
+the least significant bit of the basis-state index, so `q[0]=1, q[1]=0` is
+index `1`. Basis labels printed by the public API are **big-endian** (most
+significant qubit first), which is the conventional OpenQASM readout order:
+index `1` of a two-qubit register is printed as `01`.
+"""
+
+from __future__ import annotations
+
+import cmath
+import math
+from typing import Any
+
+from .errors import ValidationError
+from .qasm import Circuit, Operation
+
+TOLERANCE = 1e-9
+ROUND_DIGITS = 12
+
+_SQRT_HALF = math.sqrt(0.5)
+
+
+def _rotation(imaginary_sine: bool, angle: float) -> complex:
+    """`-i sin(angle)` for `rx`, `sin(angle)` for `ry`."""
+
+    sine = math.sin(angle)
+    return complex(0.0, -sine) if imaginary_sine else complex(sine, 0.0)
+
+
+def initial_state(qubits: int) -> list[complex]:
+    state = [0j] * (1 << qubits)
+    state[0] = 1 + 0j
+    return state
+
+
+def apply_operation(state: list[complex], qubits: int, operation: Operation) -> None:
+    """Apply one gate to `state` in place. `qubits` is the register width."""
+
+    if operation.name == "measure":
+        return
+    if operation.name in ("cx", "cz"):
+        _apply_controlled(state, operation.targets[0], operation.targets[1], operation.name)
+        return
+    _apply_single_qubit(state, operation, qubits)
+
+
+def _apply_single_qubit(state: list[complex], operation: Operation, qubits: int) -> None:
+    target = operation.targets[0]
+    if target >= qubits:  # pragma: no cover - the parser rejects out-of-range qubits
+        raise ValidationError(f"qubit {target} is out of range for a {qubits}-qubit circuit")
+    mask = 1 << target
+    angle = operation.angle
+    name = operation.name
+    for index in range(len(state)):
+        if index & mask:
+            continue
+        low = state[index]
+        high = state[index | mask]
+        if name == "h":
+            state[index] = (low + high) * _SQRT_HALF
+            state[index | mask] = (low - high) * _SQRT_HALF
+        elif name == "x":
+            state[index], state[index | mask] = high, low
+        elif name == "y":
+            state[index] = -1j * high
+            state[index | mask] = 1j * low
+        elif name == "z":
+            state[index | mask] = -high
+        elif name == "s":
+            state[index | mask] = 1j * high
+        elif name == "t":
+            state[index | mask] = cmath.exp(1j * math.pi / 4) * high
+        elif name == "rx":
+            cosine = math.cos(angle / 2)
+            sine = _rotation(True, angle / 2)
+            state[index] = cosine * low + sine * high
+            state[index | mask] = sine * low + cosine * high
+        elif name == "ry":
+            cosine = math.cos(angle / 2)
+            sine = _rotation(False, angle / 2)
+            state[index] = cosine * low - sine * high
+            state[index | mask] = sine * low + cosine * high
+        elif name == "rz":
+            state[index] = cmath.exp(-1j * angle / 2) * low
+            state[index | mask] = cmath.exp(1j * angle / 2) * high
+        else:  # pragma: no cover - the parser rejects unknown gates first
+            raise ValidationError(f"unsupported gate {name!r}")
+
+
+def _apply_controlled(state: list[complex], control: int, target: int, name: str) -> None:
+    control_mask = 1 << control
+    target_mask = 1 << target
+    for index in range(len(state)):
+        if not index & control_mask or index & target_mask:
+            continue
+        if name == "cx":
+            state[index], state[index | target_mask] = (
+                state[index | target_mask],
+                state[index],
+            )
+        else:  # cz
+            state[index | target_mask] = -state[index | target_mask]
+
+
+def simulate(circuit: Circuit) -> list[complex]:
+    state = initial_state(circuit.qubits)
+    for operation in circuit.operations:
+        apply_operation(state, circuit.qubits, operation)
+    return state
+
+
+def norm_squared(state: list[complex]) -> float:
+    return sum(abs(amplitude) ** 2 for amplitude in state)
+
+
+def assert_normalized(state: list[complex]) -> float:
+    """Return the normalisation defect, raising when it exceeds the tolerance."""
+
+    defect = abs(norm_squared(state) - 1.0)
+    if defect >= TOLERANCE:
+        raise ValidationError(
+            f"statevector is not normalised: |sum of |alpha|^2 minus 1| = {defect:.3e}"
+        )
+    return defect
+
+
+def basis_label(index: int, qubits: int) -> str:
+    """Big-endian bit label: qubit `qubits - 1` is the leftmost character."""
+
+    return format(index, f"0{qubits}b")
+
+
+def clean(value: float) -> float:
+    rounded = round(value, ROUND_DIGITS)
+    return 0.0 if rounded == 0 else rounded
+
+
+def clean_complex(value: complex) -> dict[str, float]:
+    real = clean(value.real)
+    imaginary = clean(value.imag)
+    if imaginary == 0:
+        imaginary = 0.0
+    return {"real": real, "imag": imaginary}
+
+
+def probabilities(state: list[complex]) -> list[float]:
+    return [abs(amplitude) ** 2 for amplitude in state]
+
+
+def nonzero_amplitudes(circuit: Circuit, state: list[complex]) -> list[dict[str, Any]]:
+    """Amplitude entries whose probability is above the reporting threshold."""
+
+    entries: list[dict[str, Any]] = []
+    for index, amplitude in enumerate(state):
+        probability = abs(amplitude) ** 2
+        if probability < TOLERANCE:
+            continue
+        entries.append(
+            {
+                "index": index,
+                "basis": basis_label(index, circuit.qubits),
+                "amplitude": clean_complex(amplitude),
+                "probability": clean(probability),
+            }
+        )
+    return entries
+
+
+def distribution(circuit: Circuit, state: list[complex]) -> dict[str, float]:
+    """Every basis state with its probability, keyed by big-endian label."""
+
+    return {
+        basis_label(index, circuit.qubits): clean(probability)
+        for index, probability in enumerate(probabilities(state))
+    }
+
+
+class Sampler:
+    """Deterministic measurement sampling driven by an explicit seed.
+
+    The generator is a splitmix64 stream: it depends only on the seed and the
+    number of draws, so the same seed always yields the same counts.
+    """
+
+    MASK = (1 << 64) - 1
+
+    def __init__(self, seed: int):
+        self.seed = seed & self.MASK
+        self.state = self.seed
+        self.draws = 0
+
+    def _next(self) -> float:
+        self.state = (self.state + 0x9E3779B97F4A7C15) & self.MASK
+        value = self.state
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & self.MASK
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & self.MASK
+        value ^= value >> 31
+        self.draws += 1
+        return (value >> 11) / float(1 << 53)
+
+    def sample(self, weights: list[float], shots: int, qubits: int) -> dict[str, int]:
+        """Draw `shots` basis labels with probability proportional to `weights`."""
+
+        cumulative: list[float] = []
+        running = 0.0
+        for weight in weights:
+            running += weight
+            cumulative.append(running)
+        total = running
+        counts: dict[str, int] = {}
+        for _ in range(shots):
+            threshold = self._next() * total
+            index = _locate(cumulative, threshold)
+            label = basis_label(index, qubits)
+            counts[label] = counts.get(label, 0) + 1
+        return counts
+
+
+def _locate(cumulative: list[float], threshold: float) -> int:
+    low = 0
+    high = len(cumulative) - 1
+    while low < high:
+        middle = (low + high) // 2
+        if cumulative[middle] <= threshold:
+            low = middle + 1
+        else:
+            high = middle
+    return low
